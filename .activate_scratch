@@ -1,0 +1,119 @@
+#!/bin/bash
+# SLURM Auto-Scratch Activation
+
+echo ""
+echo "+==============================================================+"
+echo "| SLURM SCRATCH ENVIRONMENT |"
+echo "+==============================================================+"
+_pf="/mnt/data/home/brseke961/FOMO26_project/FOMO26_code/.prolog_progress_55239.log"
+if [[ -f "$_pf" ]]; then
+cat "$_pf"
+else
+echo "| Scratch: /lustre/scratch/brseke961/job_55239"
+fi
+echo "+==============================================================+"
+echo ""
+
+export SCRATCH_DIR="/lustre/scratch/brseke961/job_55239"
+export TMPDIR="/lustre/scratch/brseke961/job_55239/tmp"
+export RESULTS_DIR="/lustre/scratch/brseke961/job_55239/results"
+export SUBMIT_DIR="/mnt/data/home/brseke961/FOMO26_project/FOMO26_code"
+
+
+cd "$SCRATCH_DIR" 2>/dev/null || {
+echo "WARNING: Nepodarilo sa prejst do scratch: $SCRATCH_DIR"
+return 1
+}
+
+_ready_file="$SCRATCH_DIR/.copy_ready"
+if [[ ! -f "$_ready_file" ]]; then
+echo ""
+echo " Cakam na dokoncenie kopirovania dat na scratch..."
+echo " (mozes sledovat: tail -F /mnt/data/home/brseke961/FOMO26_project/FOMO26_code/.prolog_progress_55239.log)"
+echo ""
+_wait_start=$(date +%s)
+_last_print=0
+while [[ ! -f "$_ready_file" ]]; do
+sleep 10
+_waited=$(( $(date +%s) - _wait_start ))
+if [[ $_waited -gt 10800 ]]; then
+echo "WARNING: Timeout cakania na kopirovanie (${_waited}s) -- pokracujem"
+break
+fi
+if [[ $(( _waited - _last_print )) -ge 30 ]]; then
+_last_print=$_waited
+_pf="/mnt/data/home/brseke961/FOMO26_project/FOMO26_code/.prolog_progress_55239.log"
+if [[ -f "$_pf" ]]; then
+_line1=$(grep "Beziaci cas" "$_pf" 2>/dev/null | tail -1 | sed 's/|//g; s/^ *//; s/ *$//')
+_line2=$(grep "Suborov" "$_pf" 2>/dev/null | tail -1 | sed 's/|//g; s/^ *//; s/ *$//')
+_pct=$(grep -oE '\] *[0-9]+%' "$_pf" 2>/dev/null | tail -1 | tr -d ' ]')
+echo " Cakam ${_waited}s | ${_pct} | ${_line1} | ${_line2}"
+else
+_dst_mb=$(du -sm "$SCRATCH_DIR" 2>/dev/null | awk "{print \$1}" || echo "?")
+echo " Cakam ${_waited}s ... scratch: ${_dst_mb}MB"
+fi
+fi
+done
+
+if [[ -f "$_ready_file" ]]; then
+_ready_content=$(cat "$_ready_file" 2>/dev/null)
+if [[ "$_ready_content" == ERROR* ]]; then
+echo "WARNING: Kopirovanie malo problem: $_ready_content"
+echo " Scratch moze byt nekompletny -- over data pred spustenim jobu"
+else
+echo "OK - Kopirovanie dokoncene!"
+fi
+_copy_secs=$(( $(date +%s) - _wait_start ))
+if [[ $_copy_secs -gt 5 ]]; then
+_copy_fmt=$(printf '%02d:%02d:%02d' $((_copy_secs/3600)) $(((_copy_secs%3600)/60)) $((_copy_secs%60)))
+echo ""
+echo " +-- WALLTIME -------------------------------------------------"
+echo " | Cakanie na kopirovanie trvalo: ${_copy_fmt}"
+echo " | POZOR: tento cas sa POCITA do tvojho --time limitu!"
+if [[ -n "${SLURM_JOB_END_TIME:-}" && "${SLURM_JOB_END_TIME}" =~ ^[0-9]+$ ]]; then
+_remain=$(( SLURM_JOB_END_TIME - $(date +%s) ))
+if [[ $_remain -gt 0 ]]; then
+_remain_fmt=$(printf '%02d:%02d:%02d' $((_remain/3600)) $(((_remain%3600)/60)) $((_remain%60)))
+echo " | Zostava na vypocet: ~${_remain_fmt}"
+if [[ $_copy_secs -gt $_remain ]]; then
+echo " | !!! Kopirovanie zralo VIAC casu nez ti zostava na vypocet !!!"
+echo " | !!! Zvys --time, alebo pre velke data pouzi .no_scratch    !!!"
+fi
+else
+echo " | !!! Walltime uz takmer vycerpany kopirovanim -- hrozi TIMEOUT !!!"
+fi
+fi
+echo " | (pre velke vstupne data zvaz: touch .no_scratch = beh z NFS)"
+echo " +-------------------------------------------------------------"
+fi
+else
+echo "WARNING: .copy_ready nenajdeny po timeout -- scratch moze byt nekompletny"
+du -sh "$SCRATCH_DIR" 2>/dev/null | awk '{print " Aktualna velkost: "$1}'
+fi
+
+_scratch_mb=$(du -sm "$SCRATCH_DIR" 2>/dev/null | awk '{print $1}' || echo 0)
+if [[ $_scratch_mb -lt 10 ]]; then
+echo ""
+echo "WARNING: Scratch je prazdny alebo takmer prazdny (${_scratch_mb}MB)!"
+echo " Mozna pricina: prolog kopirovanie zlyhalo alebo prebieha"
+echo " Skontroluj: ls -la $SCRATCH_DIR"
+echo ""
+else
+echo " Scratch velkost: ${_scratch_mb} MB -- OK"
+fi
+fi
+
+echo "OK Pracovny adresar : $(pwd)"
+echo " SCRATCH_DIR = $SCRATCH_DIR"
+echo " TMPDIR = $TMPDIR"
+echo " RESULTS_DIR = $RESULTS_DIR"
+
+echo ""
+echo "+==============================================================+"
+echo "| INFO: Po skonceni jobu sa NOVE/ZMENENE subory skopiruju do |"
+echo "| results_job_55239/ vo vasom submit adresari. |"
+echo "| Priebeh pocas COMPLETING: |"
+echo "| tail -F /mnt/data/home/brseke961/FOMO26_project/FOMO26_code/.epilog_progress_55239.log |"
+echo "+==============================================================+"
+echo ""
+

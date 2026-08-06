@@ -156,6 +156,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+asparagus/.env.finetune
+asparagus/.env.pretrain
 
 # Spyder project settings
 .spyderproject
@@ -217,3 +219,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .tools/
+
+slurm/logs/
+*.out
+*.err
+slurm_logs/
