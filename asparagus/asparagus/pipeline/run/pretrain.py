@@ -59,9 +59,12 @@ def main(cfg: DictConfig) -> None:
         TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps),
         ModelCheckpoint(
             dirpath=path_store.ckpt_save_dir,
-            every_n_epochs=cfg.model.ckpt_every_n_epoch,
-            save_top_k=1,
-            filename="last",
+            every_n_epochs=50,
+            save_top_k=-1,
+            save_last=True,
+            save_on_train_epoch_end=True,
+            filename="epoch={epoch:04d}-step={step:08d}",
+            auto_insert_metric_name=False,
             enable_version_counter=False,
         ),
         LearningRateMonitor(logging_interval="epoch", log_momentum=True),
@@ -146,7 +149,7 @@ def main(cfg: DictConfig) -> None:
     trainer.fit(
         model=model_module,
         datamodule=data_module,
-        ckpt_path="last",
+        ckpt_path="last" if cfg.resume_training else None,
     )
 
 

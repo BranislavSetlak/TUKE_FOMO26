@@ -3,9 +3,10 @@ PyTorch LightningModule for 3D DINOv2 self-supervised training.
 Handles optimizer, scheduler, training/validation steps, and teacher-student updates.
 """
 
-import lightning as L
 import math
 import re
+import lightning as L
+import torch
 from asparagus.modules.losses.dinov2 import DINOv2Loss
 from lightly.utils.optim import update_param_groups
 from lightly.utils.scheduler import CosineWarmupScheduler, cosine_schedule
@@ -81,14 +82,29 @@ class DINOv2Module(L.LightningModule):
         outputs = self.model(global_views=batch["image"], local_views=batch.get("local_views", None))
 
         loss_dict = self.criterion(outputs["pred"], global_step=self.trainer.global_step)
+        total_loss = loss_dict["total_loss"]
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(f"Non-finite SSL loss at step {self.trainer.global_step}: {loss_dict}")
+
+        mask_ratio = outputs["pred"]["mask"].float().mean()
 
         log_dict = {}
         for key, value in loss_dict.items():
             log_dict[f"train_{key}"] = value if value is not None else 0.0
 
         log_dict["global_step"] = float(self.trainer.global_step)
+        log_dict["train_mask_ratio"] = mask_ratio
         self.log_dict(log_dict, prog_bar=False, sync_dist=True, batch_size=self.trainer.datamodule.batch_size)
-        return loss_dict["total_loss"]
+
+        if self.trainer.is_global_zero and (self.trainer.global_step < 3 or self.trainer.global_step % 10 == 0):
+            printable = {
+                key: float(value.detach().cpu()) if isinstance(value, Tensor) else float(value)
+                for key, value in loss_dict.items()
+            }
+            printable["mask_ratio"] = float(mask_ratio.detach().cpu())
+            print(f"SSL_METRICS step={self.trainer.global_step} {printable}", flush=True)
+
+        return total_loss
 
     def validation_step(self, batch: tuple[Tensor, Tensor, list[str]], batch_idx: int) -> Tensor:
         raise NotImplementedError("Validation not support for DinoV2 training. Set val_steps_per_epoch to 0.")
@@ -98,7 +114,12 @@ class DINOv2Module(L.LightningModule):
 
     def configure_optimizers(self):
         # Calculate learning rate based on batch size
-        lr_scale = math.sqrt(self.trainer.datamodule.batch_size * self.trainer.world_size / 1024)
+        effective_batch_size = (
+            self.trainer.datamodule.batch_size
+            * self.trainer.world_size
+            * self.trainer.accumulate_grad_batches
+        )
+        lr_scale = math.sqrt(effective_batch_size / 1024)
         lr = self.lr * lr_scale
         num_layers = len(self.model.student_backbone.vit.blocks)
 
@@ -181,13 +202,44 @@ class DINOv2Module(L.LightningModule):
         else:
             raise ValueError(f"Unknown optimizer: {self.optimizer}")
 
-        # Fix: Ensure proper scheduler configuration
-        max_steps = max(self.trainer.estimated_stepping_batches, 1)
+        # Fix: Ensure proper scheduler configuration. During
+        # configure_optimizers Lightning can still expose
+        # num_training_batches as infinity, even when an integer
+        # limit_train_batches was configured. Prefer that explicit limit.
+        estimated_steps = self.trainer.estimated_stepping_batches
+        if not math.isfinite(estimated_steps):
+            if self.trainer.max_steps > 0:
+                estimated_steps = self.trainer.max_steps
+            else:
+                raise ValueError("Training has no finite max_steps; cannot configure the SSL schedules")
+        max_steps = max(int(estimated_steps), 1)
+
+        limited_batches = self.trainer.limit_train_batches
+        if isinstance(limited_batches, int) and limited_batches > 0:
+            batches_per_epoch = limited_batches
+        elif math.isfinite(self.trainer.num_training_batches):
+            batches_per_epoch = int(self.trainer.num_training_batches)
+        else:
+            raise ValueError(
+                "Cannot infer batches per pseudo-epoch. Set Trainer(limit_train_batches=<positive integer>)."
+            )
+
+        steps_per_epoch = max(
+            math.ceil(batches_per_epoch / self.trainer.accumulate_grad_batches),
+            1,
+        )
+        warmup_steps = min(max(self.warmup_epochs * steps_per_epoch, 1), max_steps)
+
+        print(
+            f"Optimizer schedule: max_steps={max_steps}, steps_per_epoch={steps_per_epoch}, "
+            f"warmup_steps={warmup_steps}, effective_batch_size={effective_batch_size}, lr={lr}",
+            flush=True,
+        )
 
         scheduler = {
             "scheduler": CosineWarmupScheduler(
                 optimizer=optimizer,
-                warmup_epochs=self.warmup_epochs,
+                warmup_epochs=warmup_steps,
                 max_epochs=max_steps,
                 end_value=self.min_lr / lr,
             ),
@@ -196,6 +248,8 @@ class DINOv2Module(L.LightningModule):
 
         self.criterion.max_steps = max_steps
         self.criterion.max_epochs = self.trainer.max_epochs
+        self.criterion.teacher_temp_warmup_steps = warmup_steps
+        self._training_max_steps = max_steps
         return [optimizer], [scheduler]
 
     def configure_gradient_clipping(
@@ -231,6 +285,6 @@ class DINOv2Module(L.LightningModule):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # EMA update of teacher - DDP handles synchronization automatically
-        max_steps = max(self.trainer.estimated_stepping_batches, 1000)
+        max_steps = getattr(self, "_training_max_steps", max(self.trainer.estimated_stepping_batches, 1))
         self.model.update_teacher(global_step=self.trainer.global_step, max_steps=max_steps)
         return super().on_train_batch_end(outputs, batch, batch_idx)

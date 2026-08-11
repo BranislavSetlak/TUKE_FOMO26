@@ -9,16 +9,20 @@ from torch import Tensor, nn
 from typing import Optional, Tuple, Union
 
 
-def random_block_mask(grid_size: Union[Tuple[int, int], Tuple[int, int, int]], sequence_length: int):
+def random_block_mask(
+    grid_size: Union[Tuple[int, int], Tuple[int, int, int]],
+    sequence_length: int,
+    mask_ratio: float = 0.3,
+):
     num_patches = sequence_length - 1
     assert np.prod(grid_size).item() == num_patches, (
         f"Grid size {np.prod(grid_size).item()} ({grid_size}) does not match patch count {num_patches}"
     )
 
     if len(grid_size) == 2:
-        return RandomBlockMask2D(grid_size=grid_size, max_block_size=3)
+        return RandomBlockMask2D(grid_size=grid_size, max_block_size=3, mask_ratio=mask_ratio)
     elif len(grid_size) == 3:
-        return RandomBlockMask3D(grid_size=grid_size, max_block_size=3)
+        return RandomBlockMask3D(grid_size=grid_size, max_block_size=3, mask_ratio=mask_ratio)
 
     # block_mask = block_masker(size=(B, D, H, W), device=device)
     # patch_mask = block_mask.flatten(start_dim=1)
@@ -43,6 +47,7 @@ class RandomBlockMask3D(nn.Module):
         num_masking_patches: Optional[int] = None,
         min_num_patches: int = 4,
         max_num_patches: Optional[int] = None,
+        mask_ratio: float = 0.3,
     ):
         """
         Initialize the 3D random block masking.
@@ -58,6 +63,9 @@ class RandomBlockMask3D(nn.Module):
         self.num_masking_patches = num_masking_patches
         self.min_num_patches = min_num_patches
         self.max_num_patches = max_num_patches
+        if not 0.0 < mask_ratio < 1.0:
+            raise ValueError(f"mask_ratio must be in (0, 1), got {mask_ratio}")
+        self.mask_ratio = mask_ratio
         self.mode = "advanced"
 
     def forward(
@@ -75,7 +83,7 @@ class RandomBlockMask3D(nn.Module):
         """
         if self.mode == "advanced":
             # Use advanced block masking strategy
-            return self.advanced_block_mask(batch_size, mask_ratio=0.75, device=device)
+            return self.advanced_block_mask(batch_size, mask_ratio=self.mask_ratio, device=device)
         else:
             # Default to simple block masking
             return self.simple_block_mask(batch_size, device)
@@ -161,9 +169,8 @@ class RandomBlockMask3D(nn.Module):
                 block_dims = self._apply_size_constraints(block_dims)
 
                 # Try to place block
-                if self._try_place_block(mask, block_dims, D, H, W):
-                    new_masked = block_dims[0] * block_dims[1] * block_dims[2]
-                    current_masked += new_masked
+                newly_masked = self._try_place_block(mask, block_dims, D, H, W)
+                current_masked += newly_masked
 
             masks.append(mask)
 
@@ -202,14 +209,14 @@ class RandomBlockMask3D(nn.Module):
         return [min(block_dim, vol_dim) for block_dim, vol_dim in zip(block_dims, self.grid_size)]
 
     def _try_place_block(self, mask, block_dims, D, H, W):
-        """Try to place a block in the mask. Returns True if successful."""
+        """Place a block and return the number of newly masked patches."""
         import random
 
         # Calculate valid placement ranges
         valid_ranges = [max(1, vol_dim - block_dim + 1) for vol_dim, block_dim in zip([D, H, W], block_dims)]
 
         if any(valid_range <= 0 for valid_range in valid_ranges):
-            return False
+            return 0
 
         # Random placement
         starts = [random.randint(0, valid_range - 1) for valid_range in valid_ranges]
@@ -219,11 +226,12 @@ class RandomBlockMask3D(nn.Module):
         slices = [slice(start, end) for start, end in zip(starts, ends)]
         block_region = mask[slices[0], slices[1], slices[2]]
 
-        if (~block_region).sum().item() > 0:
+        newly_masked = int((~block_region).sum().item())
+        if newly_masked > 0:
             mask[slices[0], slices[1], slices[2]] = True
-            return True
+            return newly_masked
 
-        return False
+        return 0
 
 
 class RandomBlockMask2D(RandomBlockMask3D):
@@ -243,6 +251,7 @@ class RandomBlockMask2D(RandomBlockMask3D):
         num_masking_patches: Optional[int] = None,
         min_num_patches: int = 4,
         max_num_patches: Optional[int] = None,
+        mask_ratio: float = 0.3,
     ):
         """
         Initialize the 3D random block masking.
@@ -258,6 +267,7 @@ class RandomBlockMask2D(RandomBlockMask3D):
             num_masking_patches=num_masking_patches,
             min_num_patches=min_num_patches,
             max_num_patches=max_num_patches,
+            mask_ratio=mask_ratio,
         )
 
     def advanced_block_mask(

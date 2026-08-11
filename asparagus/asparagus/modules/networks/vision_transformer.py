@@ -62,7 +62,9 @@ class MaskedVisionTransformer(nn.Module):
                 .reshape(1, self.hidden_dim, -1)
                 .transpose(1, 2)
             )
-            embeddings = embeddings + nn.Parameter(new_pos_embed)
+            # Do not wrap the interpolated tensor in a new Parameter: that
+            # detaches it from the registered learned position embeddings.
+            embeddings = embeddings + new_pos_embed
         else:
             embeddings = embeddings + self.vit.patch_embedding.position_embeddings
 

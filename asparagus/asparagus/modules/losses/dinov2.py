@@ -1,8 +1,28 @@
 import torch
+import torch.distributed as dist
 from asparagus.modules.losses.ibot import IBOTPatchLoss3D
 from lightly.loss import DINOLoss, KoLeoLoss
 from lightly.utils.scheduler import linear_warmup_schedule
 from torch import nn
+
+
+@torch.no_grad()
+def sync_distributed_center(center) -> None:
+    """Average an already-updated center across all DDP processes."""
+    if not dist.is_available() or not dist.is_initialized():
+        return
+
+    # DINOLoss uses a tensor center. This also supports Center-like
+    # objects which store their tensor in `.value`.
+    center_tensor = getattr(center, "value", center)
+
+    if not isinstance(center_tensor, torch.Tensor):
+        raise TypeError(
+            f"Expected a tensor-like DINO center, got {type(center_tensor)}"
+        )
+
+    dist.all_reduce(center_tensor, op=dist.ReduceOp.SUM)
+    center_tensor.div_(dist.get_world_size())
 
 
 class DINOv2Loss(nn.Module):
@@ -87,9 +107,9 @@ class DINOv2Loss(nn.Module):
             # Flatten any spatial mask to patch grid [B, num_patches]
             if mask.dim() > 2:
                 mask = mask.flatten(start_dim=1)
-            if teacher_patches is not None and teacher_patches.shape[:2] != mask.shape:
+            if teacher_patches is not None and teacher_patches.dim() == 3 and teacher_patches.shape[:2] != mask.shape:
                 raise ValueError(f"Teacher patch shape {teacher_patches.shape[:2]} does not match mask shape {mask.shape}")
-            if student_patches is not None and student_patches.shape[:2] != mask.shape:
+            if student_patches is not None and student_patches.dim() == 3 and student_patches.shape[:2] != mask.shape:
                 raise ValueError(f"Student patch shape {student_patches.shape[:2]} does not match mask shape {mask.shape}")
 
         if student_outputs is None or teacher_outputs is None:
@@ -114,6 +134,8 @@ class DINOv2Loss(nn.Module):
             student_out=student_outputs.chunk(n_views),  # All student views
             teacher_temp=teacher_temp,
         )
+
+        sync_distributed_center(self.dino_loss_fn.center)
 
         # Patch-level iBOT loss
         if self.ibot_loss_fn is not None:

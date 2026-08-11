@@ -1,3 +1,4 @@
+import copy
 import torch
 from asparagus.modules.networks.vision_transformer import MaskedVisionTransformer
 from asparagus.modules.transforms.blockmask import random_block_mask
@@ -37,6 +38,7 @@ class DINOv2(nn.Module):
         ibot_separate_head: bool = False,
         freeze_last_layer: int = -1,
         projection_dim: int = 65536,
+        mask_ratio: float = 0.3,
     ):
         """
         Initialize DINOv2_3D model.
@@ -62,34 +64,54 @@ class DINOv2(nn.Module):
             spatial_dims=len(img_size),
         )
 
-        self.teacher_backbone = MaskedVisionTransformer(vit=vit())
-        # Freeze teacher backbone
-        freeze_eval_module(self.teacher_backbone)
-
-        # DINO head
-        self.teacher_dino_head = DINOv2ProjectionHead(
-            input_dim=self.hidden_size,
-            output_dim=projection_dim,
-        )
-        freeze_eval_module(self.teacher_dino_head)
-
-        # Student components
+        # Initialize the student first. The EMA teacher must start as an exact
+        # copy; independently initialized targets destabilize early training.
         self.student_backbone = MaskedVisionTransformer(vit=vit())
         # Unfreeze student
         for param in self.student_backbone.parameters():
             param.requires_grad = True
         self.student_backbone.train()
 
-        self.student_dino_head = DINOv2ProjectionHead(
-            input_dim=self.hidden_size,
-            output_dim=projection_dim,
+        def make_projection_head():
+            return DINOv2ProjectionHead(
+                input_dim=self.hidden_size,
+                output_dim=projection_dim,
+            )
+
+        self.student_dino_head = make_projection_head()
+
+        self.teacher_backbone = copy.deepcopy(self.student_backbone)
+        # DINOv2ProjectionHead uses legacy torch weight_norm. Such modules
+        # cannot be deep-copied on PyTorch 2.6 because the computed weight is
+        # not a graph leaf. Instantiate an independent module, then copy its
+        # complete parameter/buffer state instead.
+        self.teacher_dino_head = make_projection_head()
+        self.teacher_dino_head.load_state_dict(self.student_dino_head.state_dict())
+        freeze_eval_module(self.teacher_backbone)
+        freeze_eval_module(self.teacher_dino_head)
+
+        if self.ibot_separate_head:
+            self.student_ibot_head = make_projection_head()
+            self.teacher_ibot_head = make_projection_head()
+            self.teacher_ibot_head.load_state_dict(self.student_ibot_head.state_dict())
+            freeze_eval_module(self.teacher_ibot_head)
+        else:
+            self.teacher_ibot_head = self.teacher_dino_head
+            self.student_ibot_head = self.student_dino_head
+
+        self.random_block_mask = random_block_mask(
+            grid_size=self.student_backbone.grid_size,
+            sequence_length=self.student_backbone.sequence_length,
+            mask_ratio=mask_ratio,
         )
 
-        self.teacher_ibot_head = self.teacher_dino_head
-        self.student_ibot_head = self.student_dino_head
-        self.random_block_mask = random_block_mask(
-            grid_size=self.student_backbone.grid_size, sequence_length=self.student_backbone.sequence_length
-        )
+    def train(self, mode: bool = True):
+        """Train the student while keeping all EMA teacher modules in eval mode."""
+        super().train(mode)
+        self.teacher_backbone.eval()
+        self.teacher_dino_head.eval()
+        self.teacher_ibot_head.eval()
+        return self
 
     def forward_teacher(self, x):
         """Forward pass for the EMA (teacher) backbone without masking."""
@@ -134,7 +156,8 @@ class DINOv2(nn.Module):
         device = global_views[0].device
         global_views = torch.cat(global_views)
 
-        if local_views is not None and len(local_views) > 0:
+        n_local_views = len(local_views) if local_views is not None else 0
+        if n_local_views > 0:
             local_views = torch.cat(local_views)
         block_mask = self.random_block_mask(batch_size=global_views.shape[0], device=device)
         patch_mask = block_mask.flatten(start_dim=1)
@@ -144,12 +167,12 @@ class DINOv2(nn.Module):
         with torch.no_grad():
             teacher_cls_token, teacher_patch_tokens = self.forward_teacher(global_views)
             teacher_cls_token = self.teacher_dino_head(teacher_cls_token)
-            teacher_patch_tokens = self.teacher_ibot_head(teacher_patch_tokens)
+            teacher_patch_tokens = self.teacher_ibot_head(teacher_patch_tokens[patch_mask])
 
         # Student forward
         student_global_cls_token, student_global_patch_tokens = self.forward_student(global_views, mask=mask)
         student_global_cls_token = self.student_dino_head(student_global_cls_token)
-        student_global_patch_tokens = self.student_ibot_head(student_global_patch_tokens)
+        student_global_patch_tokens = self.student_ibot_head(student_global_patch_tokens[patch_mask])
 
         # Local views
         if local_views is not None:
@@ -166,7 +189,7 @@ class DINOv2(nn.Module):
             "student_patch_tokens": student_global_patch_tokens,
             "student_glob_cls_token": student_global_cls_token,
             "mask": patch_mask,
-            "n_local_views": torch.tensor(local_views.shape[0] if local_views is not None else 0, device=device),
+            "n_local_views": torch.tensor(n_local_views, device=device),
         }
 
         return {"pred": out}
@@ -203,6 +226,7 @@ def vit_x(
     hidden_size=192,
     ibot_separate_head=False,
     projection_dim=65536,
+    mask_ratio=0.3,
 ):
     return DINOv2(
         input_channels=input_channels,
@@ -212,4 +236,5 @@ def vit_x(
         norm_last_layer=False,
         ibot_separate_head=ibot_separate_head,
         projection_dim=projection_dim,
+        mask_ratio=mask_ratio,
     )

@@ -224,3 +224,35 @@ slurm/logs/
 *.out
 *.err
 slurm_logs/
+
+# FOMO26 local Python environment
+fomo_env/
+
+# Model checkpoints and serialized tensors
+*.ckpt
+*.pth
+*.pt
+
+# Transferred installation archives
+*.zip
+
+# Training-framework local output
+wandb/
+lightning_logs/
+hydra/
+.hydra/
+outputs/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# General environment variants
+.env.*
+!.env.example
+
+# Local installation safety copies
+*.before_*
+backup_before_*

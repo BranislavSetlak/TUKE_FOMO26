@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from lightly.models.modules.center import Center
 from torch import Tensor, nn
@@ -27,10 +28,39 @@ class IBOTPatchLoss3D(nn.Module):
         super().__init__()
         self.teacher_temp = teacher_temp
         self.student_temp = student_temp
+        self.center_momentum = center_momentum
         self.center = Center(
             size=(1, output_dim),
             mode=center_mode,
             momentum=center_momentum,
+        )
+
+    @torch.no_grad()
+    def _update_center_distributed(self, teacher_tokens: Tensor) -> None:
+        """Update the iBOT center from teacher tokens across all GPUs."""
+        batch_sum = teacher_tokens.detach().float().sum(
+            dim=0,
+            keepdim=True,
+        )
+        token_count = torch.tensor(
+            float(teacher_tokens.shape[0]),
+            device=teacher_tokens.device,
+            dtype=torch.float32,
+        )
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(batch_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+
+        batch_center = batch_sum / token_count.clamp_min(1.0)
+        center_tensor = self.center.value
+
+        center_tensor.mul_(self.center_momentum).add_(
+            batch_center.to(
+                device=center_tensor.device,
+                dtype=center_tensor.dtype,
+            ),
+            alpha=1.0 - self.center_momentum,
         )
 
     def forward(
@@ -95,5 +125,5 @@ class IBOTPatchLoss3D(nn.Module):
         weight = (1.0 / num_masked_per_image).expand_as(mask_flat)[mask_flat]
         loss = (loss * weight).sum() / B
 
-        self.center.update(teacher_sel)
+        self._update_center_distributed(teacher_sel)
         return loss
