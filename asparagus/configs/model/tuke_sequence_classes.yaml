@@ -1,0 +1,48 @@
+class_names:
+  - dwi
+  - T1w
+  - T2w
+  - FLAIR
+  - T1c
+  - gre
+  - MP2RAGE
+  - PDw
+  - asl
+  - UNIT1
+  - swi
+  - angio
+  - m0scan
+  - other
+
+raw_to_class:
+  dwi: 0
+  T1w: 1
+  T2w: 2
+  FLAIR: 3
+  T1c: 4
+  gre: 5
+  MP2RAGE: 6
+  PDw: 7
+  asl: 8
+  UNIT1: 9
+  swi: 10
+  angio: 11
+  m0scan: 12
+  cbf: 13
+  MESE: 13
+  T1map: 13
+  FLASH: 13
+  ADC: 13
+  T2starw: 13
+  UTE: 13
+  R2starmap: 13
+  R1map: 13
+  att: 13
+  MTRmap: 13
+
+ignored_sequences:
+  scan: -100
+
+ignore_index: -100
+effective_number_beta: 0.9999
+sequence_loss_weight: 0.01
