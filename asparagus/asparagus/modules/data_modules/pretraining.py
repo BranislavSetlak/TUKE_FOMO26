@@ -8,7 +8,7 @@ from asparagus.modules.transforms.presets import pretrain_CPU_train_transforms, 
 from lightning.fabric.utilities.distributed import DistributedSamplerWrapper
 from torch.utils.data import DataLoader, RandomSampler
 from torchvision.transforms import Compose
-from typing import Literal, Optional
+from typing import Literal, Mapping, Optional
 
 
 class PretrainDataModule(pl.LightningDataModule):
@@ -23,6 +23,9 @@ class PretrainDataModule(pl.LightningDataModule):
         val_transforms: Optional[Compose] = pretrain_CPU_val_transforms,
         predict_transforms: Optional[Compose] = None,
         num_samples: Optional[int] = None,
+        sequence_raw_to_class: Optional[Mapping[str, int]] = None,
+        sequence_ignored: Optional[Mapping[str, int]] = None,
+        sequence_other_class_id: Optional[int] = None,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -34,6 +37,9 @@ class PretrainDataModule(pl.LightningDataModule):
         self.num_samples = num_samples
         self.predict_transforms = predict_transforms
         self.predict_samples = predict_samples
+        self.sequence_raw_to_class = sequence_raw_to_class
+        self.sequence_ignored = sequence_ignored
+        self.sequence_other_class_id = sequence_other_class_id
 
         logging.info(f"Using {self.num_workers} workers")
 
@@ -46,8 +52,21 @@ class PretrainDataModule(pl.LightningDataModule):
             self.setup_predict()
 
     def setup_fit(self):
-        self.train_dataset = PretrainDataset(self.train_split, transforms=self.train_transforms)
-        self.val_dataset = PretrainDataset(self.val_split, transforms=self.val_transforms)
+        sequence_kwargs = {
+            "sequence_raw_to_class": self.sequence_raw_to_class,
+            "sequence_ignored": self.sequence_ignored,
+            "sequence_other_class_id": self.sequence_other_class_id,
+        }
+        self.train_dataset = PretrainDataset(
+            self.train_split,
+            transforms=self.train_transforms,
+            **sequence_kwargs,
+        )
+        self.val_dataset = PretrainDataset(
+            self.val_split,
+            transforms=self.val_transforms,
+            **sequence_kwargs,
+        )
 
     def setup_predict(self):
         self.predict_dataset = SingleSubjectPredictDataset(
@@ -65,7 +84,7 @@ class PretrainDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             batch_size=self.batch_size,
             pin_memory=False,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
             drop_last=True,
             sampler=sampler,
         )
@@ -81,7 +100,7 @@ class PretrainDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             pin_memory=False,
             shuffle=False,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
             drop_last=True,
             sampler=sampler,
         )

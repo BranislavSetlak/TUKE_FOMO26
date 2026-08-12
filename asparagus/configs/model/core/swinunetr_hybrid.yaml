@@ -1,0 +1,21 @@
+_pretrain_net:
+  _target_: asparagus.modules.networks.swinunetr_hybrid.${model.pretrain_net}
+  input_channels: 1
+  output_channels: 1
+  num_sequence_classes: ${sequence.num_classes}
+  feature_size: ${model.feature_size}
+  depths: ${model.depths}
+  num_heads: ${model.num_heads}
+  drop_rate: ${model.drop_rate}
+  attn_drop_rate: ${model.attn_drop_rate}
+  dropout_path_rate: ${model.dropout_path_rate}
+  sequence_dropout_rate: ${model.sequence_dropout_rate}
+  use_checkpoint: ${model.use_checkpoint}
+  use_v2: ${model.use_v2}
+
+pretrain_optim: AdamW
+pretrain_lr: 1e-4
+weight_decay: 3e-5
+nesterov: true
+momentum: 0.99
+patch_embed_size: 2

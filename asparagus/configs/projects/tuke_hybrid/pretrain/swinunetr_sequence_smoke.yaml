@@ -1,0 +1,42 @@
+# @package _global_
+defaults:
+  - /default_pretrain
+  - /model/swinunetr_hybrid_b@model
+  - /model/tuke_sequence_classes@sequence
+  - /hardware/1node4gpus@hardware
+  - _self_
+
+task: PT902_FOMO300K_HF
+root: tuke_hybrid
+stem: smoke
+
+# Keep the path short: long Hydra override directory names already broke the
+# earlier DINO experiment on this filesystem.
+run_dir: ${oc.env:ASPARAGUS_MODELS}/${task}/tuke_hybrid/smoke
+run_id: ${oc.env:TUKE_HYBRID_RUN_ID,smoke_v1}
+hydra:
+  run:
+    dir: ${run_dir}/run_id=${run_id}
+
+resume_training: true
+
+training:
+  patch_size: [96, 96, 96]
+  batch_size: 1
+  accumulate_grad_batches: 1
+  max_samples: 64
+  steps_per_epoch: 8
+  val_steps_per_epoch: 2
+  warmup_ratio: 0.0
+  warmup_epochs: 1
+  rec_loss_masked_only: true
+  check_val_every_n_epoch: 1
+
+model:
+  ckpt_every_n_epoch: 1
+  ckpt_every_n_train_steps: 4
+
+logger:
+  wandb_logging: false
+  log_every_n_steps: 1
+  log_images_every_n_epoch: 1

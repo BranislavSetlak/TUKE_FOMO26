@@ -1,6 +1,7 @@
 import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from asparagus.functional.metrics import (
     distribution as dist_metrics,
     features as feat_metrics,
@@ -37,6 +38,9 @@ class SelfSupervisedModule(BaseModule):
         nesterov: bool = True,
         momentum: float = 0.99,
         weights: dict = None,
+        sequence_loss_weight: float = 0.0,
+        sequence_class_weights: Optional[list[float]] = None,
+        sequence_ignore_index: int = -100,
     ):
         super().__init__(
             model=model,
@@ -60,6 +64,16 @@ class SelfSupervisedModule(BaseModule):
         self.log_images_every_n_epoch = log_images_every_n_epoch
         self.mlflow_logging = mlflow_logging
         self.log_every_n_steps = log_every_n_steps
+        self.sequence_loss_weight = float(sequence_loss_weight)
+        self.sequence_ignore_index = int(sequence_ignore_index)
+        if self.sequence_loss_weight < 0:
+            raise ValueError("sequence_loss_weight must be non-negative")
+        if self.sequence_loss_weight > 0 and not sequence_class_weights:
+            raise ValueError("sequence_class_weights are required when sequence classification is enabled")
+        class_weights = None
+        if sequence_class_weights is not None:
+            class_weights = torch.as_tensor(sequence_class_weights, dtype=torch.float32)
+        self.register_buffer("sequence_class_weights", class_weights, persistent=True)
 
     def training_step(self, batch, batch_idx):
         x, y = batch["image"], batch["label"]
@@ -69,10 +83,14 @@ class SelfSupervisedModule(BaseModule):
             return None
 
         mask = batch.get("mask", None)
-        pred, encoder_features = self.model.forward_with_features(x)
+        pred, encoder_features, sequence_logits = self._forward_with_optional_sequence(x)
 
-        loss = self._rec_loss(pred, y, mask if self.rec_loss_masked_only else None)
-        assert not torch.isnan(loss), "Reconstruction loss is NaN"
+        reconstruction_loss = self._rec_loss(pred, y, mask if self.rec_loss_masked_only else None)
+        sequence_loss, sequence_metrics = self._sequence_loss(sequence_logits, batch.get("sequence_label"))
+        loss = reconstruction_loss + self.sequence_loss_weight * sequence_loss
+        assert not torch.isnan(reconstruction_loss), "Reconstruction loss is NaN"
+        assert not torch.isnan(sequence_loss), "Sequence classification loss is NaN"
+        assert not torch.isnan(loss), "Combined pretraining loss is NaN"
 
         # Logging
         with torch.no_grad():
@@ -80,12 +98,15 @@ class SelfSupervisedModule(BaseModule):
             transforms_applied = batch.get("transforms_applied", None)
             if self.global_step % self.log_every_n_steps == 0:  # dont compute if not being logged...
                 metrics = {
-                    "loss": loss_metrics.compute_train(loss, pred, y, mask, self._rec_loss),
+                    "loss": loss_metrics.compute_train(reconstruction_loss, pred, y, mask, self._rec_loss)
+                    | {"total": loss.detach()},
                     "features": feat_metrics.compute_train(encoder_features),
                     "masking": masking.compute(mask, x),
                     "performance": perf_metrics.compute(transforms_applied, x.shape[0]),
                     "stability": stability_metrics.compute_nan_inf_metrics(loss=loss, pred=pred, activations=encoder_features),
                 }
+                if sequence_metrics is not None:
+                    metrics["sequence"] = sequence_metrics
                 self.log_dict(
                     self._format_metrics("train", metrics),
                     sync_dist=True,
@@ -118,17 +139,24 @@ class SelfSupervisedModule(BaseModule):
 
         mask = batch.get("mask", None)
 
-        pred, encoder_features = self.model.forward_with_features(x)
-        loss = self._rec_loss(pred, y, mask if self.rec_loss_masked_only else None)
-        assert not torch.isnan(loss), "Reconstruction loss is NaN"
+        pred, encoder_features, sequence_logits = self._forward_with_optional_sequence(x)
+        reconstruction_loss = self._rec_loss(pred, y, mask if self.rec_loss_masked_only else None)
+        sequence_loss, sequence_metrics = self._sequence_loss(sequence_logits, batch.get("sequence_label"))
+        loss = reconstruction_loss + self.sequence_loss_weight * sequence_loss
+        assert not torch.isnan(reconstruction_loss), "Reconstruction loss is NaN"
+        assert not torch.isnan(sequence_loss), "Sequence classification loss is NaN"
+        assert not torch.isnan(loss), "Combined pretraining loss is NaN"
 
         # Logging
         metrics = {
-            "loss": loss_metrics.compute_val(loss, pred, y, mask, self._rec_loss),
+            "loss": loss_metrics.compute_val(reconstruction_loss, pred, y, mask, self._rec_loss)
+            | {"total": loss.detach()},
             "features": feat_metrics.compute_val(encoder_features, self.model),
             "distribution": dist_metrics.compute(x, pred, y, encoder_features),
             "reconstruction": recon_metrics.compute(pred, y, mask),
         }
+        if sequence_metrics is not None:
+            metrics["sequence"] = sequence_metrics
         self.log_dict(
             self._format_metrics("val", metrics),
             sync_dist=True,
@@ -156,6 +184,56 @@ class SelfSupervisedModule(BaseModule):
 
         return self._rec_loss_fn(pred, y)
 
+    def _forward_with_optional_sequence(self, x):
+        outputs = self.model.forward_with_features(x)
+        if not isinstance(outputs, (tuple, list)) or len(outputs) not in (2, 3):
+            raise TypeError("model.forward_with_features(x) must return (reconstruction, features[, sequence_logits])")
+        if len(outputs) == 2:
+            pred, encoder_features = outputs
+            sequence_logits = None
+        else:
+            pred, encoder_features, sequence_logits = outputs
+
+        if self.sequence_loss_weight > 0 and sequence_logits is None:
+            raise RuntimeError("Sequence classification is enabled, but the model returned no sequence logits")
+        return pred, encoder_features, sequence_logits
+
+    def _sequence_loss(self, logits, labels):
+        if self.sequence_loss_weight == 0:
+            if logits is None:
+                return torch.zeros((), device=self.device), None
+            return logits.sum() * 0.0, None
+        if labels is None:
+            raise KeyError("Batch is missing sequence_label while sequence classification is enabled")
+
+        labels = labels.long().reshape(-1)
+        if logits.ndim != 2 or logits.shape[0] != labels.shape[0]:
+            raise ValueError(
+                f"Expected sequence logits [B, C] matching {labels.shape[0]} labels, got {tuple(logits.shape)}"
+            )
+        if self.sequence_class_weights is None or logits.shape[1] != self.sequence_class_weights.numel():
+            expected_classes = 0 if self.sequence_class_weights is None else self.sequence_class_weights.numel()
+            raise ValueError(
+                f"Expected {expected_classes} sequence logits, got {logits.shape[1]}"
+            )
+
+        valid = labels != self.sequence_ignore_index
+        if not valid.any():
+            sequence_loss = logits.sum() * 0.0
+            accuracy = logits.new_zeros(())
+        else:
+            per_sample_loss = F.cross_entropy(logits[valid], labels[valid], reduction="none")
+            sample_weights = self.sequence_class_weights[labels[valid]]
+            sequence_loss = (per_sample_loss * sample_weights).mean()
+            accuracy = (logits[valid].argmax(dim=1) == labels[valid]).float().mean()
+
+        metrics = {
+            "cross_entropy": sequence_loss.detach(),
+            "accuracy": accuracy.detach(),
+            "valid_fraction": valid.float().mean().detach(),
+        }
+        return sequence_loss, metrics
+
     def on_after_backward(self):
         grad_clip_val = self.trainer.gradient_clip_val if hasattr(self.trainer, "gradient_clip_val") else None
         metrics_grouped = {
@@ -182,5 +260,7 @@ class SelfSupervisedModule(BaseModule):
 
     def predict_step(self, batch, batch_idx):
         x = batch["image"]
+        if hasattr(self.model, "encode"):
+            return self.model.encode(x)
         embeddings = self.model.encoder(x)[-1]
         return embeddings

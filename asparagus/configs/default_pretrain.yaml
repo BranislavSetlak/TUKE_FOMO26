@@ -10,6 +10,7 @@ stem:
 model:
   net: ${model.pretrain_net}
   ckpt_every_n_epoch: 5
+  ckpt_every_n_train_steps:
 
 lightning:
   data_module: PretrainDataModule

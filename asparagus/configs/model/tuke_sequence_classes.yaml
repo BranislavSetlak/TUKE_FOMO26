@@ -1,3 +1,7 @@
+enabled: true
+num_classes: 14
+other_class_id: 13
+
 class_names:
   - dwi
   - T1w

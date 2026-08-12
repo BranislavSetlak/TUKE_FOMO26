@@ -1,0 +1,7 @@
+accelerator: "gpu"
+num_nodes: 1
+num_devices: 4
+num_workers: 48
+precision: "bf16-mixed"
+strategy: "ddp"
+compile_mode:

@@ -1,6 +1,10 @@
+import glob
+import os
+import random
+
 import hydra
 import lightning as pl
-import random
+from asparagus.functional.sequence_labels import effective_number_class_weights, sequence_class_counts
 from asparagus.functional.versioning import generate_unused_run_id
 from asparagus.modules.hydra.plugins.searchpath_plugins import PretrainSearchpathPlugin
 from asparagus.paths import get_config_path
@@ -57,15 +61,27 @@ def main(cfg: DictConfig) -> None:
 
     callbacks = [
         TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps),
-        ModelCheckpoint(
-            dirpath=path_store.ckpt_save_dir,
-            every_n_epochs=cfg.model.ckpt_every_n_epoch,
-            save_top_k=1,
-            filename="last",
-            enable_version_counter=False,
-        ),
         LearningRateMonitor(logging_interval="epoch", log_momentum=True),
     ] + plugins
+
+    checkpoint_frequency = {}
+    if cfg.model.ckpt_every_n_train_steps is not None:
+        checkpoint_frequency["every_n_train_steps"] = int(cfg.model.ckpt_every_n_train_steps)
+    else:
+        checkpoint_frequency["every_n_epochs"] = int(cfg.model.ckpt_every_n_epoch)
+    callbacks.insert(
+        1,
+        ModelCheckpoint(
+            dirpath=path_store.ckpt_save_dir,
+            save_top_k=1,
+            save_last=True,
+            save_weights_only=False,
+            filename="step={step:09d}",
+            auto_insert_metric_name=False,
+            enable_version_counter=False,
+            **checkpoint_frequency,
+        ),
+    )
 
     if cfg.profiler.enabled:
         callbacks.append(instantiate(cfg.profiler._callback))
@@ -94,12 +110,47 @@ def main(cfg: DictConfig) -> None:
         cfg.model._pretrain_net,
     )
 
+    sequence_kwargs = {}
+    sequence_module_kwargs = {}
+    sequence_cfg = cfg.get("sequence")
+    if sequence_cfg is not None and sequence_cfg.get("enabled", False):
+        raw_to_class = OmegaConf.to_container(sequence_cfg.raw_to_class, resolve=True)
+        ignored_sequences = OmegaConf.to_container(sequence_cfg.ignored_sequences, resolve=True)
+        class_counts = sequence_class_counts(
+            file_store.splits["train"],
+            raw_to_class=raw_to_class,
+            ignored_sequences=ignored_sequences,
+            other_class_id=sequence_cfg.other_class_id,
+            num_classes=sequence_cfg.num_classes,
+        )
+        class_weights = effective_number_class_weights(
+            class_counts,
+            beta=sequence_cfg.effective_number_beta,
+        )
+        sequence_kwargs = {
+            "sequence_raw_to_class": raw_to_class,
+            "sequence_ignored": ignored_sequences,
+            "sequence_other_class_id": sequence_cfg.other_class_id,
+        }
+        sequence_module_kwargs = {
+            "sequence_loss_weight": sequence_cfg.sequence_loss_weight,
+            "sequence_class_weights": class_weights,
+            "sequence_ignore_index": sequence_cfg.ignore_index,
+        }
+        if int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0"))) == 0:
+            print("Sequence classification targets (training split):")
+            for class_id, (class_name, count, weight) in enumerate(
+                zip(sequence_cfg.class_names, class_counts, class_weights)
+            ):
+                print(f"  {class_id:2d} {class_name:12s} count={count:8d} weight={weight:.6f}")
+
     data_module = instantiate(
         cfg.lightning._data_module,
         train_split=file_store.splits["train"],
         val_split=file_store.splits["val"],
         train_transforms=cpu_tr_transforms,
         val_transforms=cpu_val_transforms,
+        **sequence_kwargs,
     )
 
     model_module = instantiate(
@@ -114,6 +165,7 @@ def main(cfg: DictConfig) -> None:
         mlflow_logging=cfg.logger.mlflow_logging,
         log_every_n_steps=cfg.logger.log_every_n_steps,
         log_images_every_n_epoch=cfg.logger.log_images_every_n_epoch,
+        **sequence_module_kwargs,
     )
 
     trainer = instantiate(
@@ -138,15 +190,24 @@ def main(cfg: DictConfig) -> None:
         print(f"  - Validation steps per pseudo epoch: {cfg.training.val_steps_per_epoch}")
         print(
             "  - Pseudo Epochs: {:.1f}".format(
-                cfg.training.steps / (cfg.training.steps_per_epoch * cfg.training.accumulate_grad_batches)
+                cfg.training.steps * cfg.training.accumulate_grad_batches / cfg.training.steps_per_epoch
             )
         )
         print(f"  - Warmup Pseudo Epochs: {cfg.training.warmup_epochs} (ratio {cfg.training.warmup_ratio})")
 
+    resume_candidates = [os.path.join(path_store.ckpt_save_dir, "last.ckpt")]
+    resume_candidates.extend(glob.glob(os.path.join(path_store.run_dir, "hpc_ckpt_*.ckpt")))
+    resume_candidates = [path for path in resume_candidates if os.path.isfile(path)]
+    ckpt_path = None
+    if cfg.resume_training and resume_candidates:
+        ckpt_path = max(resume_candidates, key=os.path.getmtime)
+    if trainer.is_global_zero:
+        print(f"Checkpoint restart: {ckpt_path if ckpt_path is not None else 'starting a new run'}")
+
     trainer.fit(
         model=model_module,
         datamodule=data_module,
-        ckpt_path="last",
+        ckpt_path=ckpt_path,
     )
 
 
