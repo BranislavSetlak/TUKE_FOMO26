@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=tuke-hybrid-train
 #SBATCH --partition=gpu_short
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:8
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=256G
 #SBATCH --time=30:00:00

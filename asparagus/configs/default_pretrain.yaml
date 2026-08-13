@@ -11,6 +11,7 @@ model:
   net: ${model.pretrain_net}
   ckpt_every_n_epoch: 5
   ckpt_every_n_train_steps:
+  ckpt_save_top_k: 1
 
 lightning:
   data_module: PretrainDataModule

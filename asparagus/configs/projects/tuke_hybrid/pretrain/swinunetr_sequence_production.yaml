@@ -3,7 +3,7 @@ defaults:
   - /default_pretrain
   - /model/swinunetr_hybrid_b@model
   - /model/tuke_sequence_classes@sequence
-  - /hardware/1node4gpus@hardware
+  - /hardware/1node8gpus@hardware
   - _self_
 
 task: PT902_FOMO300K_HF
@@ -21,9 +21,10 @@ hydra:
 resume_training: true
 
 training:
+  seed: 311598
   patch_size: [96, 96, 96]
   batch_size: 2
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 2
   max_samples: 6_000_000
   steps_per_epoch: 1890
   val_steps_per_epoch: 18
@@ -34,10 +35,11 @@ training:
 
 model:
   ckpt_every_n_epoch: 1
-  ckpt_every_n_train_steps: 1000
+  ckpt_every_n_train_steps: 25000
+  ckpt_save_top_k: -1
 
 logger:
-  wandb_logging: true
+  wandb_logging: false
   wandb_project: FOMO26-TUKE-Hybrid
   log_every_n_steps: 100
   log_images_every_n_epoch: 5

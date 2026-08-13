@@ -73,7 +73,7 @@ def main(cfg: DictConfig) -> None:
         1,
         ModelCheckpoint(
             dirpath=path_store.ckpt_save_dir,
-            save_top_k=1,
+            save_top_k=cfg.model.ckpt_save_top_k,
             save_last=True,
             save_weights_only=False,
             filename="step={step:09d}",

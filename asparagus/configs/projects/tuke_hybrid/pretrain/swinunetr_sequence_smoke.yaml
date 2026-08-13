@@ -3,7 +3,7 @@ defaults:
   - /default_pretrain
   - /model/swinunetr_hybrid_b@model
   - /model/tuke_sequence_classes@sequence
-  - /hardware/1node4gpus@hardware
+  - /hardware/1node8gpus@hardware
   - _self_
 
 task: PT902_FOMO300K_HF
@@ -24,7 +24,7 @@ training:
   patch_size: [96, 96, 96]
   batch_size: 1
   accumulate_grad_batches: 1
-  max_samples: 64
+  max_samples: 128
   steps_per_epoch: 8
   val_steps_per_epoch: 2
   warmup_ratio: 0.0
