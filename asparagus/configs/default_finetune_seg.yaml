@@ -47,6 +47,15 @@ training:
   tversky_beta: 0.3
   tversky_weight: 1.0
   cross_entropy_weight: 1.0
+  unified_focal_weight: 0.5
+  unified_focal_delta: 0.6
+  unified_focal_gamma: 0.5
+  probability_thresholds: [0.01, 0.05, 0.10, 0.25, 0.50]
+  anatomical_roi_enabled: False
+  anatomical_roi_center:
+  anatomical_roi_size: [160, 160, 160]
+  run_best_validation_after_fit: True
+  run_test_after_fit: True
   checkpoint_monitor: val/loss
   checkpoint_mode: min
 

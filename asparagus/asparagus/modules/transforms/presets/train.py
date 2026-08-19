@@ -1,4 +1,8 @@
 from asparagus.modules.transforms.crop import Torch_Crop
+from asparagus.modules.transforms.anatomical_roi import (
+    Torch_FixedNormalizedCrop,
+    Torch_ResizeImageAndLabel,
+)
 from asparagus.modules.transforms.gin import Torch_GIN
 from asparagus.modules.transforms.pad import Torch_Pad
 from gardening_tools.functional.transforms.spatial import get_max_rotated_size
@@ -21,7 +25,11 @@ def none(*args, **kwargs):
     return None
 
 
-def CPU_seg_train_transforms(patch_size, normalize=True):
+def CPU_seg_train_transforms(
+    patch_size,
+    normalize=True,
+    p_oversample_foreground=0.33,
+):
     if len(patch_size) == 2:
         axes = (0, 1)
     else:
@@ -38,7 +46,10 @@ def CPU_seg_train_transforms(patch_size, normalize=True):
         [
             Torch_Normalize(normalize=normalize),
             Torch_Pad(patch_size=pre_aug_patch_size),
-            Torch_Crop(patch_size=pre_aug_patch_size, p_oversample_foreground=0.33),
+            Torch_Crop(
+                patch_size=pre_aug_patch_size,
+                p_oversample_foreground=p_oversample_foreground,
+            ),
             Torch_Spatial(
                 patch_size=patch_size,
                 p_deform_all_channel=0.0,
@@ -54,6 +65,92 @@ def CPU_seg_train_transforms(patch_size, normalize=True):
                 p_mirror_per_axis=0.5,
                 axes=axes,
             ),
+        ]
+    )
+
+
+def CPU_seg_train_transforms_fg75(patch_size, normalize=True):
+    """Standard policy with 75% foreground-guaranteed training crops."""
+
+    return CPU_seg_train_transforms(
+        patch_size=patch_size,
+        normalize=normalize,
+        p_oversample_foreground=0.75,
+    )
+
+
+def CPU_seg_train_transforms_fg100(patch_size, normalize=True):
+    """Standard policy with every training crop guaranteed to contain foreground."""
+
+    return CPU_seg_train_transforms(
+        patch_size=patch_size,
+        normalize=normalize,
+        p_oversample_foreground=1.0,
+    )
+
+
+def CPU_seg_anatomical_roi_train_transforms(
+    patch_size,
+    normalized_center,
+    anatomical_roi_size,
+    normalize=True,
+):
+    """Crop a fold-specific anatomical ROI, resize it, then augment normally.
+
+    The center is estimated from training labels only. Resizing a 96^3 ROI to
+    the normal 160^3 network input provides a genuine high-resolution local
+    stage while leaving the DINO patch embedding unchanged.
+    """
+
+    axes = (0, 1, 2)
+    return transforms.Compose(
+        [
+            Torch_Normalize(normalize=normalize),
+            Torch_Pad(patch_size=anatomical_roi_size),
+            Torch_FixedNormalizedCrop(
+                roi_size=anatomical_roi_size,
+                normalized_center=normalized_center,
+            ),
+            Torch_ResizeImageAndLabel(target_size=patch_size),
+            Torch_Spatial(
+                patch_size=patch_size,
+                p_deform_all_channel=0.0,
+                p_rot_all_channel=0.2,
+                p_rot_per_axis=0.3,
+                p_scale_all_channel=0.2,
+                x_rot_in_degrees=(-15.0, 15.0),
+                y_rot_in_degrees=(-15.0, 15.0),
+                z_rot_in_degrees=(-15.0, 15.0),
+                scale_factor=(0.9, 1.1),
+                crop=False,
+                clip_to_input_range=False,
+            ),
+            Torch_Mirror(
+                p_per_sample=1.0,
+                p_mirror_per_axis=0.5,
+                axes=axes,
+            ),
+        ]
+    )
+
+
+def CPU_seg_anatomical_roi_noaug_transforms(
+    patch_size,
+    normalized_center,
+    anatomical_roi_size,
+    normalize=True,
+):
+    """Deterministic ROI transform used by the one-case overfit diagnostic."""
+
+    return transforms.Compose(
+        [
+            Torch_Normalize(normalize=normalize),
+            Torch_Pad(patch_size=anatomical_roi_size),
+            Torch_FixedNormalizedCrop(
+                roi_size=anatomical_roi_size,
+                normalized_center=normalized_center,
+            ),
+            Torch_ResizeImageAndLabel(target_size=patch_size),
         ]
     )
 

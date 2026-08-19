@@ -3,12 +3,19 @@ import numpy as np
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchmetrics.functional
 import wandb
 from asparagus.functional.metrics.utils import format_multilabel_metrics
 from asparagus.functional.reverse_preprocessing import reverse_preprocessing
 from asparagus.modules.lightning_modules.base_module import BaseModule
 from asparagus.modules.losses.asymmetric_tversky import AsymmetricTverskyCrossEntropyLoss
+from asparagus.modules.losses.unified_focal import AsymmetricUnifiedFocalLoss
+from asparagus.modules.transforms.anatomical_roi import (
+    fixed_roi_slices,
+    validate_normalized_center,
+    validate_roi_size,
+)
 from gardening_tools.functional.metrics import (
     FN,
     FP,
@@ -64,6 +71,13 @@ class SegmentationModule(BaseModule):
         tversky_beta: float = 0.3,
         tversky_weight: float = 1.0,
         cross_entropy_weight: float = 1.0,
+        unified_focal_weight: float = 0.5,
+        unified_focal_delta: float = 0.6,
+        unified_focal_gamma: float = 0.5,
+        probability_thresholds: Optional[list[float]] = None,
+        anatomical_roi_enabled: bool = False,
+        anatomical_roi_center: Optional[list[float]] = None,
+        anatomical_roi_size: Optional[list[int]] = None,
     ):
         super().__init__(
             model=model,
@@ -93,6 +107,25 @@ class SegmentationModule(BaseModule):
         self.num_classes = model.num_classes
         self.log_image_every_n_epochs = log_image_every_n_epochs
         self.deep_supervision = deep_supervision
+        self.probability_thresholds = tuple(
+            float(value)
+            for value in (probability_thresholds or [0.01, 0.05, 0.10, 0.25, 0.50])
+        )
+        if any(value <= 0.0 or value >= 1.0 for value in self.probability_thresholds):
+            raise ValueError("probability_thresholds must lie strictly inside (0, 1)")
+        if len(set(self.probability_thresholds)) != len(self.probability_thresholds):
+            raise ValueError("probability_thresholds must be unique")
+
+        self.anatomical_roi_enabled = bool(anatomical_roi_enabled)
+        self.anatomical_roi_center = None
+        self.anatomical_roi_size = None
+        if self.anatomical_roi_enabled:
+            if anatomical_roi_center is None or anatomical_roi_size is None:
+                raise ValueError(
+                    "anatomical_roi_enabled=True requires anatomical_roi_center and anatomical_roi_size"
+                )
+            self.anatomical_roi_center = validate_normalized_center(anatomical_roi_center)
+            self.anatomical_roi_size = validate_roi_size(anatomical_roi_size)
 
         self.train_metrics = self.configure_metrics("train")
         self.val_metrics = self.configure_metrics("val")
@@ -107,6 +140,14 @@ class SegmentationModule(BaseModule):
                 beta=tversky_beta,
                 tversky_weight=tversky_weight,
                 cross_entropy_weight=cross_entropy_weight,
+            )
+        elif segmentation_loss == "asymmetric_unified_focal":
+            if self.deep_supervision:
+                raise ValueError("asymmetric_unified_focal is not configured for deep supervision")
+            self.train_loss = AsymmetricUnifiedFocalLoss(
+                weight=unified_focal_weight,
+                delta=unified_focal_delta,
+                gamma=unified_focal_gamma,
             )
         else:
             raise ValueError(f"Unknown segmentation_loss: {segmentation_loss}")
@@ -182,16 +223,53 @@ class SegmentationModule(BaseModule):
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        x, y = batch["image"], batch["label"]
+    def _fixed_anatomical_roi_predict(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the local high-resolution model and paste logits into full space."""
+
+        slices = fixed_roi_slices(
+            spatial_shape=x.shape[2:],
+            roi_size=self.anatomical_roi_size,
+            normalized_center=self.anatomical_roi_center,
+        )
+        roi = x[(slice(None), slice(None), *slices)]
+        network_size = tuple(int(value) for value in self.inference_patch_size)
+        if roi.shape[2:] != network_size:
+            roi = F.interpolate(roi, size=network_size, mode="trilinear", align_corners=False)
+        roi_logits = self.model(roi)
+        if roi_logits.shape[2:] != self.anatomical_roi_size:
+            roi_logits = F.interpolate(
+                roi_logits,
+                size=self.anatomical_roi_size,
+                mode="trilinear",
+                align_corners=False,
+            )
+
+        # Outside the training-label-derived ROI, force background. A finite
+        # foreground logit avoids infinities during reverse interpolation.
+        logits = torch.zeros(
+            (x.shape[0], self.num_classes, *x.shape[2:]),
+            dtype=roi_logits.dtype,
+            device=roi_logits.device,
+        )
+        if self.num_classes > 1:
+            logits[:, 1:] = -20.0
+        logits[(slice(None), slice(None), *slices)] = roi_logits
+        return logits
+
+    def _predict_logits(self, x: torch.Tensor) -> torch.Tensor:
+        if self.anatomical_roi_enabled:
+            return self._fixed_anatomical_roi_predict(x)
         if self.sliding_window_validation:
-            pred = self.model.sliding_window_predict(
+            return self.model.sliding_window_predict(
                 data=x,
                 patch_size=self.inference_patch_size,
                 overlap=self.inference_overlap,
             )
-        else:
-            pred = self.model(x)
+        return self.model(x)
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch["image"], batch["label"]
+        pred = self._predict_logits(x)
         loss = self.val_loss(pred, y)
         self.log(
             "val/loss",
@@ -205,6 +283,7 @@ class SegmentationModule(BaseModule):
         hard_prediction = pred.argmax(dim=1)
         hard_target = y.squeeze(1).long()
         self._log_foreground_behavior("val", pred, y)
+        self._update_threshold_diagnostics(pred, y)
         for sample_index in range(x.shape[0]):
             for label_index in range(1, self.num_classes):
                 prediction_mask = hard_prediction[sample_index] == label_index
@@ -253,11 +332,20 @@ class SegmentationModule(BaseModule):
         target_count = target_foreground.sum().float()
         total_count = torch.tensor(predicted_foreground.numel(), device=logits.device, dtype=torch.float32)
         background_count = (~target_foreground).sum().float().clamp_min(1.0)
+        foreground_probability = 1.0 - logits.float().softmax(dim=1)[:, 0]
+        positive_patch_fraction = target_foreground.flatten(start_dim=1).any(dim=1).float().mean()
+        if target_count > 0:
+            target_foreground_probability = foreground_probability[target_foreground].mean()
+        else:
+            target_foreground_probability = torch.zeros((), device=logits.device)
         metrics = {
             f"{stage}/pred_foreground_fraction": predicted_count / total_count,
             f"{stage}/target_foreground_fraction": target_count / total_count,
             f"{stage}/false_positive_fraction": false_positive.sum().float() / background_count,
             f"{stage}/pred_to_target_volume_ratio": predicted_count / target_count.clamp_min(1.0),
+            f"{stage}/positive_patch_fraction": positive_patch_fraction,
+            f"{stage}/target_foreground_probability": target_foreground_probability,
+            f"{stage}/max_foreground_probability": foreground_probability.max(),
         }
         self.log_dict(
             metrics,
@@ -267,15 +355,41 @@ class SegmentationModule(BaseModule):
             batch_size=logits.shape[0],
         )
 
+    @staticmethod
+    def _threshold_tag(threshold: float) -> str:
+        return f"t{int(round(threshold * 100)):03d}"
+
+    def _update_threshold_diagnostics(self, logits: torch.Tensor, target: torch.Tensor) -> None:
+        foreground_probability = 1.0 - logits.float().softmax(dim=1)[:, 0]
+        target_foreground = target.squeeze(1).long() > 0
+        for index, threshold in enumerate(self.probability_thresholds):
+            predicted_foreground = foreground_probability >= threshold
+            self._val_threshold_tp[index] += torch.sum(
+                predicted_foreground & target_foreground
+            ).double()
+            self._val_threshold_fp[index] += torch.sum(
+                predicted_foreground & ~target_foreground
+            ).double()
+            self._val_threshold_fn[index] += torch.sum(
+                ~predicted_foreground & target_foreground
+            ).double()
+
     def on_validation_epoch_start(self):
         n_foreground_classes = max(self.num_classes - 1, 1)
         self._val_dice_sum = torch.zeros(n_foreground_classes, device=self.device, dtype=torch.float64)
         self._val_dice_count = torch.zeros(n_foreground_classes, device=self.device, dtype=torch.float64)
+        threshold_shape = (len(self.probability_thresholds),)
+        self._val_threshold_tp = torch.zeros(threshold_shape, device=self.device, dtype=torch.float64)
+        self._val_threshold_fp = torch.zeros(threshold_shape, device=self.device, dtype=torch.float64)
+        self._val_threshold_fn = torch.zeros(threshold_shape, device=self.device, dtype=torch.float64)
 
     def on_validation_epoch_end(self):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(self._val_dice_sum)
             torch.distributed.all_reduce(self._val_dice_count)
+            torch.distributed.all_reduce(self._val_threshold_tp)
+            torch.distributed.all_reduce(self._val_threshold_fp)
+            torch.distributed.all_reduce(self._val_threshold_fn)
 
         valid = self._val_dice_count > 0
         if torch.any(valid):
@@ -285,6 +399,48 @@ class SegmentationModule(BaseModule):
         self.log(
             "val/foreground_dice",
             foreground_dice.float(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=False,
+        )
+
+        threshold_dice_values = []
+        for index, threshold in enumerate(self.probability_thresholds):
+            tp = self._val_threshold_tp[index]
+            fp = self._val_threshold_fp[index]
+            fn = self._val_threshold_fn[index]
+            dice_denominator = 2.0 * tp + fp + fn
+            threshold_dice = torch.where(
+                dice_denominator > 0,
+                2.0 * tp / dice_denominator,
+                torch.zeros_like(dice_denominator),
+            )
+            recall_denominator = tp + fn
+            threshold_recall = torch.where(
+                recall_denominator > 0,
+                tp / recall_denominator,
+                torch.zeros_like(recall_denominator),
+            )
+            tag = self._threshold_tag(threshold)
+            self.log(
+                f"val/foreground_dice_{tag}",
+                threshold_dice.float(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+            )
+            self.log(
+                f"val/foreground_recall_{tag}",
+                threshold_recall.float(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+            )
+            threshold_dice_values.append(threshold_dice)
+        self.log(
+            "val/best_threshold_dice",
+            torch.stack(threshold_dice_values).max().float(),
             on_step=False,
             on_epoch=True,
             prog_bar=True,
@@ -312,11 +468,7 @@ class SegmentationModule(BaseModule):
     def test_step(self, batch, batch_idx):
         x = batch["image"]
 
-        logits = self.model.sliding_window_predict(
-            data=x,
-            patch_size=self.inference_patch_size,
-            overlap=self.inference_overlap,
-        )
+        logits = self._predict_logits(x)
 
         src_logits = reverse_preprocessing(logits, batch["properties"])
         src_label = batch["src_label"]
@@ -340,11 +492,7 @@ class SegmentationModule(BaseModule):
 
     def predict_step(self, batch, batch_idx):
         x = batch["image"]
-        logits = self.model.sliding_window_predict(
-            data=x,
-            patch_size=self.inference_patch_size,
-            overlap=self.inference_overlap,
-        )
+        logits = self._predict_logits(x)
         src_logits = reverse_preprocessing(logits, batch["properties"])
         return src_logits, batch["properties"]
 

@@ -91,9 +91,17 @@ def main(cfg: DictConfig) -> None:
     lr_monitor_callback = LearningRateMonitor(logging_interval="epoch", log_momentum=True)
     profilers = None
 
+    cpu_train_kwargs = {"patch_size": cfg.training.patch_size}
+    if cfg.training.anatomical_roi_enabled:
+        if cfg.training.anatomical_roi_center is None:
+            raise ValueError("anatomical_roi_enabled=True requires anatomical_roi_center")
+        cpu_train_kwargs.update(
+            normalized_center=cfg.training.anatomical_roi_center,
+            anatomical_roi_size=cfg.training.anatomical_roi_size,
+        )
     cpu_tr_transforms = instantiate(
         cfg.transforms._cpu_tr_transforms,
-        patch_size=cfg.training.patch_size,
+        **cpu_train_kwargs,
     )
     cpu_val_transforms = instantiate(
         cfg.transforms._cpu_val_transforms,
@@ -154,6 +162,13 @@ def main(cfg: DictConfig) -> None:
         tversky_beta=cfg.training.tversky_beta,
         tversky_weight=cfg.training.tversky_weight,
         cross_entropy_weight=cfg.training.cross_entropy_weight,
+        unified_focal_weight=cfg.training.unified_focal_weight,
+        unified_focal_delta=cfg.training.unified_focal_delta,
+        unified_focal_gamma=cfg.training.unified_focal_gamma,
+        probability_thresholds=cfg.training.probability_thresholds,
+        anatomical_roi_enabled=cfg.training.anatomical_roi_enabled,
+        anatomical_roi_center=cfg.training.anatomical_roi_center,
+        anatomical_roi_size=cfg.training.anatomical_roi_size,
     )
 
     trainer = instantiate(
@@ -183,24 +198,26 @@ def main(cfg: DictConfig) -> None:
         ckpt_path="last" if cfg.resume_training else None,
     )
 
-    validation_results = trainer.validate(
-        model=model_module,
-        datamodule=data_module,
-        ckpt_path=best_ckpt_callback.best_model_path,
-    )
-    if trainer.is_global_zero:
-        save_json(
-            validation_results[0],
-            os.path.join(path_store.run_dir, "validation_best_metrics.json"),
+    if cfg.training.run_best_validation_after_fit:
+        validation_results = trainer.validate(
+            model=model_module,
+            datamodule=data_module,
+            ckpt_path=best_ckpt_callback.best_model_path,
         )
+        if trainer.is_global_zero:
+            save_json(
+                validation_results[0],
+                os.path.join(path_store.run_dir, "validation_best_metrics.json"),
+            )
 
-    model_module.model.apply(set_params_to_zero)
+    if cfg.training.run_test_after_fit:
+        model_module.model.apply(set_params_to_zero)
 
-    trainer.test(
-        model=model_module,
-        datamodule=data_module,
-        ckpt_path=best_ckpt_callback.best_model_path,
-    )
+        trainer.test(
+            model=model_module,
+            datamodule=data_module,
+            ckpt_path=best_ckpt_callback.best_model_path,
+        )
 
 
 if __name__ == "__main__":
