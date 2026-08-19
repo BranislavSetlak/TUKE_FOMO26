@@ -35,6 +35,7 @@ class ClsRegBase(BaseModule):
         test_output_path: str = None,
         load_decoder: bool = True,
         repeat_stem_weights: bool = True,
+        freeze_backbone: bool = False,
     ):
         super().__init__(
             model=model,
@@ -53,6 +54,7 @@ class ClsRegBase(BaseModule):
             momentum=momentum,
             load_decoder=load_decoder,
             repeat_stem_weights=repeat_stem_weights,
+            freeze_backbone=freeze_backbone,
         )
         self.loss = None
         self.task_type = None
@@ -191,6 +193,8 @@ class ClassificationModule(ClsRegBase):
             {
                 f"{prefix}/acc": MulticlassAccuracy(num_classes=self.num_classes, average=None),
                 f"{prefix}/auroc": MulticlassAUROC(num_classes=self.num_classes, average=None),
+                f"{prefix}/acc_macro": MulticlassAccuracy(num_classes=self.num_classes, average="macro"),
+                f"{prefix}/auroc_macro": MulticlassAUROC(num_classes=self.num_classes, average="macro"),
             },
         )
 
@@ -220,6 +224,7 @@ class RegressionModule(ClsRegBase):
         return MetricCollection(
             {
                 f"{prefix}/MSE": MeanSquaredError(num_outputs=self.num_classes),
+                f"{prefix}/MAE": MeanAbsoluteError(num_outputs=self.num_classes),
             },
         )
 

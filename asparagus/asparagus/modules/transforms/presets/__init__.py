@@ -14,6 +14,7 @@ from .train import (
     CPU_seg_train_transforms,
     CPU_seg_val_transforms,
     GPU_all_train_transforms,
+    GPU_all_train_transforms_gin,
     none,
 )
 
@@ -27,6 +28,7 @@ __all__ = [
     "CPU_seg_train_transforms",
     "CPU_seg_val_transforms",
     "GPU_all_train_transforms",
+    "GPU_all_train_transforms_gin",
     "pretrain_CPU_train_transforms",
     "pretrain_CPU_val_transforms",
     "pretrain_GPU_train_transforms",

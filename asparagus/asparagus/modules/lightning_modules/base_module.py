@@ -42,6 +42,7 @@ class BaseModule(L.LightningModule):
         repeat_stem_weights: bool = True,
         pretrained_target_size: Optional[tuple] = None,
         target_size: Optional[tuple] = None,
+        freeze_backbone: bool = False,
     ):
         super().__init__()
         self.learning_rate = learning_rate
@@ -63,6 +64,7 @@ class BaseModule(L.LightningModule):
         self.nesterov = nesterov
         self.momentum = momentum
         self.repeat_stem_weights = repeat_stem_weights
+        self.freeze_backbone = bool(freeze_backbone)
         assert 0 < cosine_period_ratio <= 1
 
         self.save_hyperparameters(ignore=["model", "weights", "train_transforms", "val_transforms", "test_transforms"])
@@ -70,6 +72,13 @@ class BaseModule(L.LightningModule):
 
         if weights is not None:
             self.load_state_dict(weights, load_decoder=load_decoder, strict=False)
+
+        if self.freeze_backbone:
+            if not hasattr(model, "freeze_backbone"):
+                raise ValueError(
+                    f"freeze_backbone=True, but {model.__class__.__name__} has no freeze_backbone() method"
+                )
+            model.freeze_backbone()
 
         self.model = torch.compile(model, mode=compile_mode) if compile_mode is not None else model
 
@@ -83,10 +92,22 @@ class BaseModule(L.LightningModule):
 
     def configure_optimizers(self):
         # Separate encoder and decoder parameters for different warmup schedules
+        if self.freeze_backbone and self.decoder_warmup_epochs > 0:
+            raise ValueError("decoder_warmup_epochs must be 0 when the backbone is frozen")
+
         if self.decoder_warmup_epochs > 0:
             param_groups = separate_encoder_decoder_weights(self.named_parameters())
         else:
-            param_groups = self.parameters()
+            param_groups = [parameter for parameter in self.parameters() if parameter.requires_grad]
+
+        trainable_parameters = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+        total_parameters = sum(parameter.numel() for parameter in self.parameters())
+        if trainable_parameters == 0:
+            raise ValueError("The model has no trainable parameters")
+        print(
+            f"Trainable parameters: {trainable_parameters:,}/{total_parameters:,} "
+            f"({100.0 * trainable_parameters / total_parameters:.2f}%)"
+        )
 
         if self.optimizer == "SGD":
             optimizer = SGD(

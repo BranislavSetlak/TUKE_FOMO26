@@ -8,6 +8,7 @@ import wandb
 from asparagus.functional.metrics.utils import format_multilabel_metrics
 from asparagus.functional.reverse_preprocessing import reverse_preprocessing
 from asparagus.modules.lightning_modules.base_module import BaseModule
+from asparagus.modules.losses.asymmetric_tversky import AsymmetricTverskyCrossEntropyLoss
 from gardening_tools.functional.metrics import (
     FN,
     FP,
@@ -55,6 +56,14 @@ class SegmentationModule(BaseModule):
         momentum: float = 0.99,
         load_decoder: bool = True,
         repeat_stem_weights: bool = True,
+        freeze_backbone: bool = False,
+        sliding_window_validation: bool = False,
+        inference_overlap: float = 0.5,
+        segmentation_loss: str = "dice_ce",
+        tversky_alpha: float = 0.7,
+        tversky_beta: float = 0.3,
+        tversky_weight: float = 1.0,
+        cross_entropy_weight: float = 1.0,
     ):
         super().__init__(
             model=model,
@@ -73,8 +82,13 @@ class SegmentationModule(BaseModule):
             momentum=momentum,
             load_decoder=load_decoder,
             repeat_stem_weights=repeat_stem_weights,
+            freeze_backbone=freeze_backbone,
         )
         self.inference_patch_size = inference_patch_size
+        self.sliding_window_validation = bool(sliding_window_validation)
+        self.inference_overlap = float(inference_overlap)
+        if not 0 <= self.inference_overlap < 1:
+            raise ValueError("inference_overlap must be in [0, 1)")
         self.test_output_path = test_output_path
         self.num_classes = model.num_classes
         self.log_image_every_n_epochs = log_image_every_n_epochs
@@ -83,7 +97,19 @@ class SegmentationModule(BaseModule):
         self.train_metrics = self.configure_metrics("train")
         self.val_metrics = self.configure_metrics("val")
 
-        self.train_loss = DiceCE()
+        if segmentation_loss == "dice_ce":
+            self.train_loss = DiceCE()
+        elif segmentation_loss == "asymmetric_tversky_ce":
+            if self.deep_supervision:
+                raise ValueError("asymmetric_tversky_ce is not configured for deep supervision")
+            self.train_loss = AsymmetricTverskyCrossEntropyLoss(
+                alpha=tversky_alpha,
+                beta=tversky_beta,
+                tversky_weight=tversky_weight,
+                cross_entropy_weight=cross_entropy_weight,
+            )
+        else:
+            raise ValueError(f"Unknown segmentation_loss: {segmentation_loss}")
         self.val_loss = DiceCE()
 
         if self.deep_supervision:
@@ -127,6 +153,8 @@ class SegmentationModule(BaseModule):
             pred = pred[0]
             y = y[0]
 
+        self._log_foreground_behavior("train", pred, y)
+
         metrics = self.train_metrics(pred, y.squeeze(1))
         self.log_dict(
             format_multilabel_metrics(metrics, ignore_index=self.ignore_index_in_metrics),
@@ -156,7 +184,14 @@ class SegmentationModule(BaseModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["label"]
-        pred = self.model(x)
+        if self.sliding_window_validation:
+            pred = self.model.sliding_window_predict(
+                data=x,
+                patch_size=self.inference_patch_size,
+                overlap=self.inference_overlap,
+            )
+        else:
+            pred = self.model(x)
         loss = self.val_loss(pred, y)
         self.log(
             "val/loss",
@@ -164,8 +199,22 @@ class SegmentationModule(BaseModule):
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=self.trainer.datamodule.batch_size,
+            batch_size=x.shape[0],
         )
+
+        hard_prediction = pred.argmax(dim=1)
+        hard_target = y.squeeze(1).long()
+        self._log_foreground_behavior("val", pred, y)
+        for sample_index in range(x.shape[0]):
+            for label_index in range(1, self.num_classes):
+                prediction_mask = hard_prediction[sample_index] == label_index
+                target_mask = hard_target[sample_index] == label_index
+                denominator = torch.sum(prediction_mask) + torch.sum(target_mask)
+                if denominator > 0:
+                    self._val_dice_sum[label_index - 1] += (
+                        2 * torch.sum(prediction_mask & target_mask) / denominator
+                    )
+                    self._val_dice_count[label_index - 1] += 1
 
         metrics = self.val_metrics(pred, y.squeeze(1))
         self.log_dict(
@@ -173,7 +222,7 @@ class SegmentationModule(BaseModule):
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=self.trainer.datamodule.batch_size,
+            batch_size=x.shape[0],
         )
         if (
             self.current_epoch > 0
@@ -191,6 +240,56 @@ class SegmentationModule(BaseModule):
                 log_key="val",
                 task_type="segmentation",
             )
+
+    def _log_foreground_behavior(self, stage: str, logits: torch.Tensor, target: torch.Tensor) -> None:
+        """Expose collapse and over-segmentation directly in every epoch log."""
+        hard_prediction = logits.argmax(dim=1)
+        hard_target = target.squeeze(1).long()
+        predicted_foreground = hard_prediction > 0
+        target_foreground = hard_target > 0
+        false_positive = predicted_foreground & ~target_foreground
+
+        predicted_count = predicted_foreground.sum().float()
+        target_count = target_foreground.sum().float()
+        total_count = torch.tensor(predicted_foreground.numel(), device=logits.device, dtype=torch.float32)
+        background_count = (~target_foreground).sum().float().clamp_min(1.0)
+        metrics = {
+            f"{stage}/pred_foreground_fraction": predicted_count / total_count,
+            f"{stage}/target_foreground_fraction": target_count / total_count,
+            f"{stage}/false_positive_fraction": false_positive.sum().float() / background_count,
+            f"{stage}/pred_to_target_volume_ratio": predicted_count / target_count.clamp_min(1.0),
+        }
+        self.log_dict(
+            metrics,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=logits.shape[0],
+        )
+
+    def on_validation_epoch_start(self):
+        n_foreground_classes = max(self.num_classes - 1, 1)
+        self._val_dice_sum = torch.zeros(n_foreground_classes, device=self.device, dtype=torch.float64)
+        self._val_dice_count = torch.zeros(n_foreground_classes, device=self.device, dtype=torch.float64)
+
+    def on_validation_epoch_end(self):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(self._val_dice_sum)
+            torch.distributed.all_reduce(self._val_dice_count)
+
+        valid = self._val_dice_count > 0
+        if torch.any(valid):
+            foreground_dice = torch.mean(self._val_dice_sum[valid] / self._val_dice_count[valid])
+        else:
+            foreground_dice = torch.zeros((), device=self.device, dtype=torch.float64)
+        self.log(
+            "val/foreground_dice",
+            foreground_dice.float(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=False,
+        )
 
     def on_test_epoch_start(self):
         self.test_metrics = [
@@ -216,7 +315,7 @@ class SegmentationModule(BaseModule):
         logits = self.model.sliding_window_predict(
             data=x,
             patch_size=self.inference_patch_size,
-            overlap=0.5,
+            overlap=self.inference_overlap,
         )
 
         src_logits = reverse_preprocessing(logits, batch["properties"])
@@ -244,7 +343,7 @@ class SegmentationModule(BaseModule):
         logits = self.model.sliding_window_predict(
             data=x,
             patch_size=self.inference_patch_size,
-            overlap=0.5,
+            overlap=self.inference_overlap,
         )
         src_logits = reverse_preprocessing(logits, batch["properties"])
         return src_logits, batch["properties"]

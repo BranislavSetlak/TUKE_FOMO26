@@ -12,6 +12,7 @@ from asparagus.pipeline.auto_configuration.experiment_setup import (
 )
 from asparagus.pipeline.auto_configuration.logging import logging
 from dotenv import load_dotenv
+from gardening_tools.functional.paths.write import save_json
 from gardening_tools.modules.networks.components.weight_init import set_params_to_zero
 from hydra.core.hydra_config import HydraConfig
 from hydra.core.plugins import Plugins
@@ -64,17 +65,23 @@ def main(cfg: DictConfig) -> None:
 
     best_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
-        monitor="val/loss",
-        mode="min",
+        monitor=cfg.training.checkpoint_monitor,
+        mode=cfg.training.checkpoint_mode,
         save_top_k=1,
         filename="best",
         enable_version_counter=False,
     )
     last_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
+        save_last=True,
+        save_top_k=0,
+        enable_version_counter=False,
+    )
+    periodic_ckpt_callback = ModelCheckpoint(
+        dirpath=path_store.ckpt_save_dir,
         every_n_epochs=cfg.model.ckpt_every_n_epoch,
-        save_top_k=1,
-        filename="last",
+        save_top_k=-1,
+        filename="periodic-{epoch:03d}",
         enable_version_counter=False,
     )
 
@@ -100,6 +107,8 @@ def main(cfg: DictConfig) -> None:
         val_transforms=cpu_val_transforms,
         test_samples=file_store.test,
         test_transforms=CPU_clsreg_val_test_transforms_crop(target_size=cfg.training.target_size),
+        full_validation=cfg.training.full_validation,
+        val_batch_size=cfg.training.val_batch_size,
     )
 
     model = instantiate(
@@ -119,8 +128,12 @@ def main(cfg: DictConfig) -> None:
         log_image_every_n_epochs=cfg.logger.log_images_every_n_epoch,
         optimizer=cfg.model.finetune_optim,
         learning_rate=cfg.model.finetune_lr,
+        weight_decay=cfg.model.weight_decay,
+        nesterov=cfg.model.nesterov,
+        momentum=cfg.model.momentum,
         load_decoder=cfg.training.load_decoder,
         repeat_stem_weights=cfg.training.repeat_stem_weights,
+        freeze_backbone=cfg.training.freeze_backbone,
         test_output_path=os.path.join(
             path_store.run_dir,
             "predictions",
@@ -132,6 +145,7 @@ def main(cfg: DictConfig) -> None:
         cfg.lightning._trainer,
         callbacks=[
             last_ckpt_callback,
+            periodic_ckpt_callback,
             best_ckpt_callback,
             progressbar_callback,
             lr_monitor_callback,
@@ -151,7 +165,19 @@ def main(cfg: DictConfig) -> None:
     trainer.fit(
         model=model_module,
         datamodule=data_module,
+        ckpt_path="last" if cfg.resume_training else None,
     )
+
+    validation_results = trainer.validate(
+        model=model_module,
+        datamodule=data_module,
+        ckpt_path=best_ckpt_callback.best_model_path,
+    )
+    if trainer.is_global_zero:
+        save_json(
+            validation_results[0],
+            os.path.join(path_store.run_dir, "validation_best_metrics.json"),
+        )
 
     model_module.model.apply(set_params_to_zero)
 

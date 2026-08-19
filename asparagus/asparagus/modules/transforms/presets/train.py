@@ -1,4 +1,5 @@
 from asparagus.modules.transforms.crop import Torch_Crop
+from asparagus.modules.transforms.gin import Torch_GIN
 from asparagus.modules.transforms.pad import Torch_Pad
 from gardening_tools.functional.transforms.spatial import get_max_rotated_size
 from gardening_tools.modules.transforms.bias_field import Torch_BiasField
@@ -194,7 +195,7 @@ def CPU_seg_test_transforms(patch_size, normalize=True):
     )
 
 
-def GPU_all_train_transforms(ndim=3, deep_supervision=False):
+def GPU_all_train_transforms(ndim=3, deep_supervision=False, use_gin=False):
     axes = (0, ndim)
     tforms = transforms.Compose(
         [
@@ -212,4 +213,19 @@ def GPU_all_train_transforms(ndim=3, deep_supervision=False):
     if deep_supervision:
         tforms.transforms.append(Torch_DownsampleSegForDS(deep_supervision=True))
 
+    # GIN is intentionally last: the paper describes it as an additional
+    # appearance stage following standard spatial/intensity augmentation.
+    if use_gin:
+        if ndim != 3:
+            raise ValueError("The bundled GIN experiment is defined for 3-D inputs")
+        tforms.transforms.append(Torch_GIN(probability=1.0))
+
     return tforms
+
+
+def GPU_all_train_transforms_gin(ndim=3, deep_supervision=False):
+    return GPU_all_train_transforms(
+        ndim=ndim,
+        deep_supervision=deep_supervision,
+        use_gin=True,
+    )

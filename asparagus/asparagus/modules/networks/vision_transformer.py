@@ -4,6 +4,8 @@ MaskedVisionTransformerMONAI3D: Wrapper for MONAI ViT with 3D masked image model
 Handles dynamic input sizes and patch masking for self-supervised learning.
 """
 
+from math import prod
+
 import torch
 from torch import nn
 
@@ -23,7 +25,14 @@ class MaskedVisionTransformer(nn.Module):
         self.patch_size = getattr(vit.patch_embedding.patch_embeddings, "kernel_size")
         self.spatial_dims = len(self.patch_size)
 
-        self.grid_size = [round(self.sequence_length ** (1 / self.spatial_dims))] * self.spatial_dims
+        n_positions = int(self.vit.patch_embedding.position_embeddings.shape[1])
+        root_n_positions = round(n_positions ** (1 / self.spatial_dims))
+        self.grid_size = [root_n_positions] * self.spatial_dims
+        if prod(self.grid_size) != n_positions:
+            raise ValueError(
+                "MaskedVisionTransformer currently requires a regular pretraining grid; "
+                f"got {n_positions} positional embeddings."
+            )
 
         # Initialize learnable parameters
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
@@ -33,15 +42,8 @@ class MaskedVisionTransformer(nn.Module):
         elif self.spatial_dims == 3:
             self.interpolation_mode = "trilinear"
 
-    def encode(self, x, mask=None):
-        """
-        Forward pass with optional masking and dynamic input sizes.
-        Args:
-            x: Input tensor (B, C, D, H, W)
-            mask: Optional mask tensor (B, sequence_length)
-        Returns:
-            Patch embeddings (with optional masking)
-        """
+    def _prepare_tokens(self, x, mask=None):
+        """Create CLS + patch tokens, including dynamic positional interpolation."""
         B = x.shape[0]
 
         # Get patch embeddings and reshape if needed
@@ -49,12 +51,20 @@ class MaskedVisionTransformer(nn.Module):
         embeddings = embeddings.flatten(2).transpose(1, 2)
 
         if embeddings.shape[1] != self.vit.patch_embedding.position_embeddings.shape[1]:
-            root_n_positions = round(embeddings.shape[1] ** (1 / self.spatial_dims))
-            new_grid_size = [root_n_positions] * self.spatial_dims
-            x = self.vit.patch_embedding.position_embeddings.transpose(1, 2).reshape(1, self.hidden_dim, *self.grid_size)
+            new_grid_size = [
+                int(spatial_size // patch_size)
+                for spatial_size, patch_size in zip(x.shape[2:], self.patch_size)
+            ]
+            if prod(new_grid_size) != embeddings.shape[1]:
+                raise ValueError(
+                    f"Input shape {tuple(x.shape[2:])} is not compatible with patch size {self.patch_size}."
+                )
+            pos_embed = self.vit.patch_embedding.position_embeddings.transpose(1, 2).reshape(
+                1, self.hidden_dim, *self.grid_size
+            )
             new_pos_embed = (
                 torch.nn.functional.interpolate(
-                    x,
+                    pos_embed,
                     size=new_grid_size,
                     mode=self.interpolation_mode,
                     align_corners=False,
@@ -95,11 +105,47 @@ class MaskedVisionTransformer(nn.Module):
             embeddings = embeddings.clone()
             embeddings[:, 1:] = embeddings[:, 1:] * (1 - w) + mask_tokens * w
 
+        return embeddings
+
+    def encode(self, x, mask=None):
+        """
+        Forward pass with optional masking and dynamic input sizes.
+        Args:
+            x: Input tensor (B, C, D, H, W)
+            mask: Optional mask tensor (B, sequence_length)
+        Returns:
+            Final normalized token embeddings.
+        """
+        embeddings = self._prepare_tokens(x, mask=mask)
+
         # Pass through transformer
         for blk in self.vit.blocks:
             embeddings = blk(embeddings)
 
         return self.vit.norm(embeddings)
+
+    def get_intermediate_layers(self, x, n: int = 1, mask=None):
+        """Return normalized tokens from the final ``n`` transformer blocks.
+
+        DINO/DINOv2 linear evaluation uses several final blocks instead of
+        discarding all but the last representation.  Keeping this method on
+        the wrapper also lets dense heads consume patch tokens without
+        changing the self-supervised pretraining forward path.
+        """
+        n = int(n)
+        n_blocks = len(self.vit.blocks)
+        if n < 1 or n > n_blocks:
+            raise ValueError(f"n must be in [1, {n_blocks}], got {n}")
+
+        embeddings = self._prepare_tokens(x, mask=mask)
+        outputs = []
+        first_output_block = n_blocks - n
+        for index, block in enumerate(self.vit.blocks):
+            embeddings = block(embeddings)
+            if index >= first_output_block:
+                outputs.append(self.vit.norm(embeddings))
+
+        return tuple(outputs)
 
     def forward(self, x, mask=None):
         """

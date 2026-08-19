@@ -28,12 +28,18 @@ class SegDataModule(pl.LightningDataModule):
         train_transforms: Optional[Compose] = None,
         test_transforms: Optional[Compose] = None,
         val_transforms: Optional[Compose] = None,
+        full_validation: bool = False,
+        val_batch_size: Optional[int] = None,
+        carvemix_probability: float = 0.0,
     ):
         super().__init__()
         self.batch_size = batch_size
         self.train_transforms = train_transforms
         self.test_transforms = test_transforms
         self.val_transforms = val_transforms
+        self.full_validation = bool(full_validation)
+        self.val_batch_size = int(val_batch_size) if val_batch_size is not None else self.batch_size
+        self.carvemix_probability = float(carvemix_probability)
         self.num_workers = num_workers
         self.train_split = train_split
         self.test_samples = test_samples
@@ -55,6 +61,7 @@ class SegDataModule(pl.LightningDataModule):
         self.train_dataset = SegDataset(
             self.train_split,
             transforms=self.train_transforms,
+            carvemix_probability=self.carvemix_probability,
         )
 
         self.val_dataset = SegDataset(
@@ -90,18 +97,20 @@ class SegDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
-        sampler = RandomSampler(self.val_dataset, num_samples=999999, replacement=True)
-        if dist.is_initialized():
-            sampler = DistributedSamplerWrapper(sampler)
+        sampler = None
+        if not self.full_validation:
+            sampler = RandomSampler(self.val_dataset, num_samples=999999, replacement=True)
+            if dist.is_initialized():
+                sampler = DistributedSamplerWrapper(sampler)
 
         return DataLoader(
             self.val_dataset,
             num_workers=self.num_workers,
-            batch_size=self.batch_size,
+            batch_size=self.val_batch_size,
             pin_memory=False,
             shuffle=False,
             persistent_workers=True,
-            drop_last=True,
+            drop_last=not self.full_validation,
             sampler=sampler,
         )
 
@@ -138,6 +147,8 @@ class ClsRegDataModule(pl.LightningDataModule):
         test_samples: Optional[list] = [],
         predict_samples: Optional[list] = [],
         use_random_datasampler: Optional[bool] = True,
+        full_validation: bool = False,
+        val_batch_size: Optional[int] = None,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -149,6 +160,8 @@ class ClsRegDataModule(pl.LightningDataModule):
         self.val_split = val_split
         self.test_samples = test_samples
         self.use_random_datasampler = use_random_datasampler
+        self.full_validation = bool(full_validation)
+        self.val_batch_size = int(val_batch_size) if val_batch_size is not None else self.batch_size
         self.predict_samples = predict_samples
         self.predict_transforms = predict_transforms
         logging.info(f"Using {self.num_workers} workers")
@@ -203,14 +216,14 @@ class ClsRegDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         sampler = None
-        if self.use_random_datasampler:
+        if self.use_random_datasampler and not self.full_validation:
             sampler = RandomSampler(self.val_dataset, num_samples=999999, replacement=True)
             sampler = DistributedSamplerWrapper(sampler) if dist.is_initialized() else sampler
 
         return DataLoader(
             self.val_dataset,
             num_workers=self.num_workers // 2,
-            batch_size=self.batch_size,
+            batch_size=self.val_batch_size,
             pin_memory=False,
             persistent_workers=True,
             drop_last=False,
