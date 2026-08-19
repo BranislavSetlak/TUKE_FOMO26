@@ -126,6 +126,7 @@ def main(cfg: DictConfig) -> None:
         optimizer=cfg.model.finetune_optim,
         learning_rate=cfg.model.finetune_lr,
         warmup_epochs=cfg.training.warmup_epochs,
+        decoder_warmup_epochs=cfg.training.decoder_warmup_epochs,
         weight_decay=cfg.model.weight_decay,
         nesterov=cfg.model.nesterov,
         momentum=cfg.model.momentum,

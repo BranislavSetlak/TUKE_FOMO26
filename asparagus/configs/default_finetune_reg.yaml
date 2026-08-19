@@ -31,6 +31,7 @@ training:
   seed: ${random:0,1000000}
   accumulate_grad_batches: 1
   warmup_epochs: 0
+  decoder_warmup_epochs: 0
   check_val_every_n_epoch: 1
   load_decoder: True
   repeat_stem_weights: True
