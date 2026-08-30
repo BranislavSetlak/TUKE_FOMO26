@@ -36,6 +36,16 @@ training:
   accumulate_grad_batches: 1
   load_decoder: False
   repeat_stem_weights: True
+  full_validation: False
+  val_batch_size: 1
+  sliding_window_validation: False
+  inference_overlap: 0.5
+  carvemix_probability: 0.0
+  carvemix_donor_attempts: 4
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
+  run_best_validation_after_fit: False
+  run_test_after_fit: True
 
 transforms:
   cpu_tr_transforms: CPU_seg_train_transforms

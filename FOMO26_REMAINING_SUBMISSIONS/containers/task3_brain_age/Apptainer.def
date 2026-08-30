@@ -1,0 +1,34 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+
+%labels
+    Author TUKE FOMO26
+    Version 1.0.0
+    Description FOMO26 Task 3 five-fold TUKE SwinUNETR brain-age regression
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export FOMO_WEIGHTS_DIR=/app/weights
+
+%files
+    containers/task3_brain_age/predict.py /app/predict.py
+    containers/common/model.py /app/model.py
+    containers/common/preprocessing.py /app/preprocessing.py
+    containers/common/inference.py /app/inference.py
+    containers/common/requirements.txt /app/requirements.txt
+    containers/task3_brain_age/weights /app/weights
+
+%post
+    set -eu
+    mkdir -p /app /input /output
+    python -m pip install --no-cache-dir -r /app/requirements.txt
+    test "$(find /app/weights -name 'fold_*.pt' -type f | wc -l)" -eq 5
+    python -m py_compile /app/*.py
+
+%test
+    python -c "from einops import rearrange; import monai, nibabel, numpy, scipy, torch; print('DEPENDENCY_IMPORTS_OK')"
+    python /app/predict.py --help >/dev/null
+
+%runscript
+    exec python /app/predict.py "$@"

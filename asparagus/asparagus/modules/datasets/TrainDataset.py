@@ -2,6 +2,7 @@ import nibabel as nib
 import numpy as np
 import torch
 import torchvision
+from asparagus.modules.transforms.carvemix import Torch_CarveMix
 from asparagus.paths import get_data_path, get_source_labels_path
 from gardening_tools.functional.nibabel_utils import reorient_nib_image
 from gardening_tools.functional.paths.read import load_pickle, read_file_to_nifti_or_np
@@ -15,20 +16,61 @@ class SegDataset(Dataset):
         self,
         files: list,
         transforms: Optional[torchvision.transforms.Compose] = None,
+        carvemix_probability: float = 0.0,
+        carvemix_donor_attempts: int = 4,
     ):
         super().__init__()
 
         self.files = files
         self.transforms = transforms
+        self.carvemix = Torch_CarveMix(probability=carvemix_probability)
+        self.carvemix_donor_attempts = int(carvemix_donor_attempts)
+        if self.carvemix_donor_attempts < 1:
+            raise ValueError("carvemix_donor_attempts must be at least one")
+        if carvemix_probability > 0 and self.transforms is None:
+            raise ValueError("CarveMix requires fixed-size training transforms")
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
+        data_dict = self._load_data_dict(idx)
+        data_dict = self._apply_transforms(data_dict)
+
+        # default_collate requires identical keys in every nested mapping.
+        # Previously only samples selected for CarveMix received this entry,
+        # so mixed/unmixed pairs crashed with KeyError('carvemix').
+        data_dict.setdefault("transforms_applied", {})["carvemix"] = {
+            "applied": False,
+            "donor": "",
+            "threshold": 0.0,
+            "roi_voxels": 0,
+        }
+
+        apply_carvemix = (
+            self.carvemix.probability > 0
+            and len(self.files) > 1
+            and float(torch.rand(())) < self.carvemix.probability
+        )
+        if apply_carvemix:
+            donor_dict = None
+            for _ in range(self.carvemix_donor_attempts):
+                donor_offset = int(torch.randint(1, len(self.files), ()).item())
+                donor_idx = (idx + donor_offset) % len(self.files)
+                candidate = self._apply_transforms(self._load_data_dict(donor_idx))
+                donor_dict = candidate
+                if torch.any(candidate["label"] > 0):
+                    break
+            data_dict = self.carvemix(data_dict, donor_dict, force=True)
+
+        data_dict.pop("foreground_locations", None)
+        return data_dict
+
+    def _load_data_dict(self, idx):
         file = self.files[idx]
         data = torch.load(file)
         foreground_locations = load_pickle(file.replace(".pt", ".pkl"))["foreground_locations"]
-        data_dict = {
+        return {
             "file_path": file,
             "image": data[:-1],
             "label": data[-1:],
@@ -36,12 +78,9 @@ class SegDataset(Dataset):
             "transforms_applied": {},
         }
 
-        return self._transform(data_dict)
-
-    def _transform(self, data_dict):
+    def _apply_transforms(self, data_dict):
         if self.transforms is not None:
             data_dict = self.transforms(data_dict)
-        data_dict.pop("foreground_locations")
         return data_dict
 
 

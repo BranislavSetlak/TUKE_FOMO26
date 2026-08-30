@@ -55,6 +55,8 @@ class SegmentationModule(BaseModule):
         momentum: float = 0.99,
         load_decoder: bool = True,
         repeat_stem_weights: bool = True,
+        sliding_window_validation: bool = False,
+        inference_overlap: float = 0.5,
     ):
         super().__init__(
             model=model,
@@ -75,6 +77,10 @@ class SegmentationModule(BaseModule):
             repeat_stem_weights=repeat_stem_weights,
         )
         self.inference_patch_size = inference_patch_size
+        self.sliding_window_validation = bool(sliding_window_validation)
+        self.inference_overlap = float(inference_overlap)
+        if not 0.0 <= self.inference_overlap < 1.0:
+            raise ValueError("inference_overlap must be in [0, 1)")
         self.test_output_path = test_output_path
         self.num_classes = model.num_classes
         self.log_image_every_n_epochs = log_image_every_n_epochs
@@ -100,7 +106,6 @@ class SegmentationModule(BaseModule):
                 ),
                 f"{prefix}/F1": MulticlassF1Score(
                     num_classes=self.num_classes,
-                    ignore_index=0 if self.num_classes > 1 else None,
                     average=None,
                 ),
             },
@@ -126,6 +131,8 @@ class SegmentationModule(BaseModule):
             # its corresponding prediction which is always the first entry in each list.
             pred = pred[0]
             y = y[0]
+
+        self._log_foreground_behavior("train", pred, y)
 
         metrics = self.train_metrics(pred, y.squeeze(1))
         self.log_dict(
@@ -156,7 +163,14 @@ class SegmentationModule(BaseModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["label"]
-        pred = self.model(x)
+        if self.sliding_window_validation:
+            pred = self.model.sliding_window_predict(
+                data=x,
+                patch_size=self.inference_patch_size,
+                overlap=self.inference_overlap,
+            )
+        else:
+            pred = self.model(x)
         loss = self.val_loss(pred, y)
         self.log(
             "val/loss",
@@ -164,8 +178,10 @@ class SegmentationModule(BaseModule):
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=self.trainer.datamodule.batch_size,
+            batch_size=x.shape[0],
         )
+
+        self._update_validation_epoch_metrics(pred, y)
 
         metrics = self.val_metrics(pred, y.squeeze(1))
         self.log_dict(
@@ -173,7 +189,7 @@ class SegmentationModule(BaseModule):
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=self.trainer.datamodule.batch_size,
+            batch_size=x.shape[0],
         )
         if (
             self.current_epoch > 0
@@ -191,6 +207,167 @@ class SegmentationModule(BaseModule):
                 log_key="val",
                 task_type="segmentation",
             )
+
+    def _log_foreground_behavior(self, prefix: str, logits: torch.Tensor, target: torch.Tensor) -> None:
+        """Log collapse diagnostics alongside the existing per-class Dice."""
+
+        probabilities = torch.softmax(logits.float(), dim=1)
+        prediction = torch.argmax(probabilities, dim=1)
+        target_index = target.squeeze(1).long()
+        predicted_foreground = prediction > 0
+        target_foreground = target_index > 0
+        intersection = (predicted_foreground & target_foreground).float().sum()
+        denominator = predicted_foreground.float().sum() + target_foreground.float().sum()
+        foreground_dice = (2.0 * intersection + 1e-8) / (denominator + 1e-8)
+        foreground_class_dice = []
+        for class_id in range(1, self.num_classes):
+            predicted_class = prediction == class_id
+            target_class = target_index == class_id
+            class_intersection = (predicted_class & target_class).float().sum()
+            class_denominator = predicted_class.float().sum() + target_class.float().sum()
+            foreground_class_dice.append(
+                (2.0 * class_intersection + 1e-8) / (class_denominator + 1e-8)
+            )
+        minimum_foreground_class_dice = torch.stack(foreground_class_dice).min()
+        foreground_probability = probabilities[:, 1:].sum(dim=1)
+        if target_foreground.any():
+            target_foreground_probability = foreground_probability[target_foreground].mean()
+        else:
+            target_foreground_probability = foreground_probability.new_zeros(())
+
+        values = {
+            f"{prefix}/foreground_dice": foreground_dice,
+            f"{prefix}/min_foreground_class_dice": minimum_foreground_class_dice,
+            f"{prefix}/pred_foreground_fraction": predicted_foreground.float().mean(),
+            f"{prefix}/target_foreground_fraction": target_foreground.float().mean(),
+            f"{prefix}/target_foreground_probability": target_foreground_probability,
+            f"{prefix}/max_foreground_probability": foreground_probability.max(),
+        }
+        self.log_dict(
+            values,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=self.trainer.datamodule.batch_size,
+        )
+
+    def on_validation_epoch_start(self):
+        n_foreground = self.num_classes - 1
+        self._val_class_dice_sum = torch.zeros(n_foreground, device=self.device, dtype=torch.float64)
+        self._val_class_dice_count = torch.zeros(n_foreground, device=self.device, dtype=torch.float64)
+        self._val_binary_dice_sum = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_binary_dice_count = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_predicted_foreground = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_target_foreground = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_false_positive = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_background = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_voxels = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_target_probability_sum = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_target_probability_count = torch.zeros((), device=self.device, dtype=torch.float64)
+        self._val_max_foreground_probability = torch.zeros((), device=self.device, dtype=torch.float64)
+
+    def _update_validation_epoch_metrics(self, logits: torch.Tensor, target: torch.Tensor) -> None:
+        """Accumulate exact full-fold metrics without treating absent classes as Dice 1."""
+
+        probabilities = torch.softmax(logits.float(), dim=1)
+        prediction = torch.argmax(probabilities, dim=1)
+        target_index = target.squeeze(1).long()
+        predicted_foreground = prediction > 0
+        target_foreground = target_index > 0
+
+        for sample_index in range(logits.shape[0]):
+            predicted_sample = predicted_foreground[sample_index]
+            target_sample = target_foreground[sample_index]
+            denominator = predicted_sample.sum() + target_sample.sum()
+            if denominator > 0:
+                intersection = (predicted_sample & target_sample).sum()
+                self._val_binary_dice_sum += (2.0 * intersection / denominator).double()
+                self._val_binary_dice_count += 1.0
+
+            for class_id in range(1, self.num_classes):
+                predicted_class = prediction[sample_index] == class_id
+                target_class = target_index[sample_index] == class_id
+                class_denominator = predicted_class.sum() + target_class.sum()
+                if class_denominator > 0:
+                    class_intersection = (predicted_class & target_class).sum()
+                    self._val_class_dice_sum[class_id - 1] += (
+                        2.0 * class_intersection / class_denominator
+                    ).double()
+                    self._val_class_dice_count[class_id - 1] += 1.0
+
+        self._val_predicted_foreground += predicted_foreground.sum().double()
+        self._val_target_foreground += target_foreground.sum().double()
+        self._val_false_positive += (predicted_foreground & ~target_foreground).sum().double()
+        self._val_background += (~target_foreground).sum().double()
+        self._val_voxels += torch.tensor(target_index.numel(), device=self.device, dtype=torch.float64)
+
+        foreground_probability = probabilities[:, 1:].sum(dim=1)
+        if target_foreground.any():
+            self._val_target_probability_sum += foreground_probability[target_foreground].sum().double()
+            self._val_target_probability_count += target_foreground.sum().double()
+        self._val_max_foreground_probability = torch.maximum(
+            self._val_max_foreground_probability,
+            foreground_probability.max().double(),
+        )
+
+    def on_validation_epoch_end(self):
+        sum_tensors = (
+            self._val_class_dice_sum,
+            self._val_class_dice_count,
+            self._val_binary_dice_sum,
+            self._val_binary_dice_count,
+            self._val_predicted_foreground,
+            self._val_target_foreground,
+            self._val_false_positive,
+            self._val_background,
+            self._val_voxels,
+            self._val_target_probability_sum,
+            self._val_target_probability_count,
+        )
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if distributed:
+            for value in sum_tensors:
+                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(
+                self._val_max_foreground_probability,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+
+        valid_classes = self._val_class_dice_count > 0
+        class_dice = torch.zeros_like(self._val_class_dice_sum)
+        class_dice[valid_classes] = (
+            self._val_class_dice_sum[valid_classes] / self._val_class_dice_count[valid_classes]
+        )
+        minimum_class_dice = class_dice[valid_classes].min() if valid_classes.any() else class_dice.new_zeros(())
+        macro_class_dice = class_dice[valid_classes].mean() if valid_classes.any() else class_dice.new_zeros(())
+        binary_dice = self._val_binary_dice_sum / self._val_binary_dice_count.clamp_min(1.0)
+
+        values = {
+            "val/foreground_dice": binary_dice.float(),
+            "val/macro_foreground_class_dice": macro_class_dice.float(),
+            "val/min_foreground_class_dice": minimum_class_dice.float(),
+            "val/pred_foreground_fraction": (
+                self._val_predicted_foreground / self._val_voxels.clamp_min(1.0)
+            ).float(),
+            "val/target_foreground_fraction": (
+                self._val_target_foreground / self._val_voxels.clamp_min(1.0)
+            ).float(),
+            "val/false_positive_fraction": (
+                self._val_false_positive / self._val_background.clamp_min(1.0)
+            ).float(),
+            "val/pred_to_target_volume_ratio": (
+                self._val_predicted_foreground / self._val_target_foreground.clamp_min(1.0)
+            ).float(),
+            "val/target_foreground_probability": (
+                self._val_target_probability_sum / self._val_target_probability_count.clamp_min(1.0)
+            ).float(),
+            "val/max_foreground_probability": self._val_max_foreground_probability.float(),
+        }
+        for class_id, dice_value in enumerate(class_dice, start=1):
+            if valid_classes[class_id - 1]:
+                values[f"val/exact_dice_{class_id}"] = dice_value.float()
+
+        self.log_dict(values, on_step=False, on_epoch=True, sync_dist=False)
 
     def on_test_epoch_start(self):
         self.test_metrics = [
@@ -216,7 +393,7 @@ class SegmentationModule(BaseModule):
         logits = self.model.sliding_window_predict(
             data=x,
             patch_size=self.inference_patch_size,
-            overlap=0.5,
+            overlap=self.inference_overlap,
         )
 
         src_logits = reverse_preprocessing(logits, batch["properties"])
@@ -244,7 +421,7 @@ class SegmentationModule(BaseModule):
         logits = self.model.sliding_window_predict(
             data=x,
             patch_size=self.inference_patch_size,
-            overlap=0.5,
+            overlap=self.inference_overlap,
         )
         src_logits = reverse_preprocessing(logits, batch["properties"])
         return src_logits, batch["properties"]

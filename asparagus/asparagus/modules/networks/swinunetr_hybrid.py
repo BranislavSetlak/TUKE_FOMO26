@@ -3,6 +3,7 @@
 from typing import Sequence
 
 import torch
+from monai.inferers import sliding_window_inference
 from monai.networks.nets import SwinUNETR
 from torch import nn
 
@@ -37,7 +38,30 @@ class SwinUNETRHybrid(nn.Module):
             raise ValueError("MONAI SwinUNETR feature_size must be divisible by 12")
 
         self.num_sequence_classes = int(num_sequence_classes)
+        self.num_classes = int(output_channels)
         self.feature_size = int(feature_size)
+        # SwinUNETR has three raw-input convolutions. BaseModule expands all of
+        # them when a one-channel checkpoint is transferred to SEG009's two
+        # input modalities.
+        self.stem_weight_names = (
+            "swin_unetr.swinViT.patch_embed.proj.weight",
+            "swin_unetr.encoder1.layer.conv1.conv.weight",
+            "swin_unetr.encoder1.layer.conv3.conv.weight",
+        )
+        self.stem_weight_name = self.stem_weight_names[0]
+        self.decoder_weight_prefixes = (
+            "swin_unetr.encoder1.",
+            "swin_unetr.encoder2.",
+            "swin_unetr.encoder3.",
+            "swin_unetr.encoder4.",
+            "swin_unetr.encoder10.",
+            "swin_unetr.decoder1.",
+            "swin_unetr.decoder2.",
+            "swin_unetr.decoder3.",
+            "swin_unetr.decoder4.",
+            "swin_unetr.decoder5.",
+            "swin_unetr.out.",
+        )
         self.swin_unetr = SwinUNETR(
             in_channels=input_channels,
             out_channels=output_channels,
@@ -96,6 +120,22 @@ class SwinUNETRHybrid(nn.Module):
         reconstruction, _, _ = self.forward_with_features(x)
         return reconstruction
 
+    def sliding_window_predict(
+        self,
+        data: torch.Tensor,
+        patch_size: Sequence[int],
+        overlap: float = 0.5,
+    ) -> torch.Tensor:
+        """Run MONAI sliding-window inference for downstream segmentation."""
+
+        return sliding_window_inference(
+            inputs=data,
+            roi_size=tuple(int(value) for value in patch_size),
+            sw_batch_size=1,
+            predictor=self,
+            overlap=float(overlap),
+        )
+
     def freeze_backbone(self) -> None:
         """Freeze only the Swin encoder; decoder and auxiliary head stay trainable."""
 
@@ -104,7 +144,54 @@ class SwinUNETRHybrid(nn.Module):
         self.swin_unetr.swinViT.eval()
 
 
+class SwinUNETRSegmentation(SwinUNETRHybrid):
+    """Downstream view with identical parameter names and no classifier call."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden_states = self._hidden_states(x)
+        return self._decode(x, hidden_states)
+
+
+class SwinUNETRClsReg(SwinUNETRHybrid):
+    """Downstream classifier/regressor using the pretrained Swin bottleneck.
+
+    The full SwinUNETR object is retained so checkpoint parameter names remain
+    identical to pretraining.  Only ``swin_unetr.swinViT`` and this lightweight
+    head participate in ``forward``; the reconstruction decoder is deliberately
+    excluded by ``training.load_decoder=false`` during transfer.
+    """
+
+    def __init__(self, downstream_dropout_rate: float = 0.1, **kwargs):
+        super().__init__(**kwargs)
+        # Only this raw-input weight participates in cls/reg forward.  Avoid
+        # requiring reconstruction-only input convolutions during transfer.
+        self.stem_weight_names = ("swin_unetr.swinViT.patch_embed.proj.weight",)
+        self.stem_weight_name = self.stem_weight_names[0]
+        self.downstream_head = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(1),
+            nn.LayerNorm(self.feature_size * 16),
+            nn.Dropout(p=float(downstream_dropout_rate)),
+            nn.Linear(self.feature_size * 16, self.num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.downstream_head(self.encode(x))
+
+
 def swinunetr_hybrid(**kwargs) -> SwinUNETRHybrid:
     """Hydra-friendly constructor."""
 
     return SwinUNETRHybrid(**kwargs)
+
+
+def swinunetr_segmentation(**kwargs) -> SwinUNETRSegmentation:
+    """Hydra-friendly downstream constructor with checkpoint-compatible keys."""
+
+    return SwinUNETRSegmentation(**kwargs)
+
+
+def swinunetr_clsreg(**kwargs) -> SwinUNETRClsReg:
+    """Hydra-friendly classifier/regressor with checkpoint-compatible keys."""
+
+    return SwinUNETRClsReg(**kwargs)

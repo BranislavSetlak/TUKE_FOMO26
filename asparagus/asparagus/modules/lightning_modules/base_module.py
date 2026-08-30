@@ -1,4 +1,3 @@
-import copy
 import lightning as L
 import numpy as np
 import torch
@@ -156,98 +155,114 @@ class BaseModule(L.LightningModule):
 
         return [optimizer], [scheduler_config]
 
-    def load_state_dict(self, state_dict, load_decoder=True, *args, **kwargs):
-        old_params = copy.deepcopy(self.state_dict())
+    def load_state_dict(self, state_dict, strict=True, assign=False, *, load_decoder=True):
+        """Load either transfer weights or a native Lightning checkpoint safely.
 
-        target_compiled = "_orig" in next(iter(old_params.keys()))
-        source_compiled = "_orig" in next(iter(state_dict.keys()))
+        The return value intentionally matches ``torch.nn.Module.load_state_dict``.
+        Lightning consumes that value when it restores ``best.ckpt`` or resumes
+        training.  A checkpoint is considered loaded when keys were accepted,
+        even when its values equal the model's current values.
+        """
 
+        if not state_dict:
+            raise ValueError("Cannot load an empty state_dict")
+
+        state_dict = dict(state_dict)
+        target_params = self.state_dict()
+        target_compiled = any(key.startswith("model._orig_mod.") for key in target_params)
+        source_compiled = any(key.startswith("model._orig_mod.") for key in state_dict)
         print(f"Target compiled: {target_compiled}, source compiled: {source_compiled}")
 
-        if not target_compiled and source_compiled:
-            print("Source state_dict is compiled, but target model is not. Removing _orig suffix from state_dict keys.")
-            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        if source_compiled and not target_compiled:
+            print("Removing _orig_mod from compiled source state_dict keys.")
+            state_dict = {key.replace("model._orig_mod.", "model.", 1): value for key, value in state_dict.items()}
+        elif target_compiled and not source_compiled:
+            print("Adding _orig_mod to source state_dict keys for the compiled target.")
+            state_dict = {
+                (key.replace("model.", "model._orig_mod.", 1) if key.startswith("model.") else key): value
+                for key, value in state_dict.items()
+            }
 
-        # Repeat stem weights when state_dict num_channels is smaller than new_state_dict num_channels
-        if hasattr(self.model, "stem_weight_name") and self.model.stem_weight_name is not None and self.repeat_stem_weights:
-            prefix = "model._orig_mod." if "_orig_mod" in list(state_dict.keys())[0] else "model."
-            stem_name = f"{prefix}{self.model.stem_weight_name}"
-            pt_input_channels = state_dict[stem_name].shape[1]
-            ft_input_channels = old_params[stem_name].shape[1]
-            if pt_input_channels < ft_input_channels:
-                assert pt_input_channels == 1, (
-                    "Stem weights can only be repeated if the input channels in the state_dict is 1."
-                )
-                print(f"Repeating stem weights from {pt_input_channels} to {ft_input_channels} channels for {stem_name}.")
-                state_dict[stem_name] = state_dict[stem_name].repeat(1, ft_input_channels, 1, 1, 1) / ft_input_channels
+        stem_weight_names = getattr(self.model, "stem_weight_names", None)
+        if stem_weight_names is None:
+            stem_weight_name = getattr(self.model, "stem_weight_name", None)
+            stem_weight_names = [] if stem_weight_name is None else [stem_weight_name]
+        if self.repeat_stem_weights:
+            prefix = "model._orig_mod." if target_compiled else "model."
+            for stem_weight_name in stem_weight_names:
+                stem_name = f"{prefix}{stem_weight_name}"
+                if stem_name not in state_dict or stem_name not in target_params:
+                    raise KeyError(f"Configured stem weight is absent: {stem_name}")
+                source_channels = state_dict[stem_name].shape[1]
+                target_channels = target_params[stem_name].shape[1]
+                if source_channels == target_channels:
+                    continue
+                if source_channels != 1 or target_channels <= 1:
+                    raise ValueError(
+                        f"Cannot adapt {stem_name} from {source_channels} to {target_channels} input channels"
+                    )
+                print(f"Repeating stem weights from {source_channels} to {target_channels} channels for {stem_name}.")
+                repeats = [1] * state_dict[stem_name].ndim
+                repeats[1] = target_channels
+                state_dict[stem_name] = state_dict[stem_name].repeat(*repeats) / target_channels
 
-        # Interpolate positional embeddings when spatial dimensions differ
         if self.pretrained_target_size is not None and self.target_size is not None:
-            for key in list(state_dict.keys()):
-                if key not in old_params or old_params[key].shape == state_dict[key].shape:
+            for key in list(state_dict):
+                if key not in target_params or target_params[key].shape == state_dict[key].shape:
                     continue
                 if key.endswith("pos_embed"):
                     num_prefix_tokens = getattr(self.model.eva, "num_prefix_tokens", 0)
                     patch_embed_size = tuple(self.model.encoder.proj.weight.shape[2:])
-                    print(f"Interpolating {key}: {state_dict[key].shape} -> {old_params[key].shape}")
+                    print(f"Interpolating {key}: {state_dict[key].shape} -> {target_params[key].shape}")
                     state_dict[key] = resize_pos_embed_3d(
                         state_dict[key],
-                        old_params[key],
+                        target_params[key],
                         num_prefix_tokens=num_prefix_tokens,
                         pretrained_target_size=self.pretrained_target_size,
                         target_size=self.target_size,
                         patch_embed_size=patch_embed_size,
                     )
 
-        # Filter out keys that are not in the old state dict or have different shapes
-        def should_load_key(key, state_dict, old_params, load_decoder):
-            # reject all decoder keys regardless of their shape
-            if not load_decoder and key.startswith("model.decoder"):
-                return False
-            # accept all keys that are in the old state dict and have the same shape
-            return (key in old_params) and (old_params[key].shape == state_dict[key].shape)
+        decoder_prefixes = tuple(getattr(self.model, "decoder_weight_prefixes", ("decoder",)))
 
-        # Filter state_dict to only include keys that should be loaded
-        state_dict = {k: v for k, v in state_dict.items() if should_load_key(k, state_dict, old_params, load_decoder)}
+        def is_decoder_key(key):
+            relative_key = key
+            for prefix in ("model._orig_mod.", "model."):
+                if relative_key.startswith(prefix):
+                    relative_key = relative_key[len(prefix) :]
+                    break
+            return any(relative_key.startswith(prefix) for prefix in decoder_prefixes)
 
-        # Lists used to inform master of our whereabouts
-        rejected_keys_new = [k for k in state_dict.keys() if k not in old_params]
-        state_dict = {k: v for k, v in state_dict.items() if k in old_params}
-        rejected_keys_shape = [k for k in state_dict.keys() if old_params[k].shape != state_dict[k].shape]
-        rejected_keys_decoder = [k for k in state_dict.keys() if not load_decoder and k.startswith("model.decoder")]
-
-        # Load the state dict
-        kwargs["strict"] = False
-        super().load_state_dict(state_dict, *args, **kwargs)
-
-        # Check if weights were actually loaded
-        new_params = self.state_dict()
-        rejected_keys_data = []
-
-        successful = 0
-        unsuccessful = 0
-        for param_name, p1, p2 in zip(old_params.keys(), old_params.values(), new_params.values()):
-            if p1.data.ne(p2.data).sum() > 0:
-                successful += 1
+        rejected_new = []
+        rejected_shape = []
+        rejected_decoder = []
+        accepted = {}
+        for key, value in state_dict.items():
+            if key not in target_params:
+                rejected_new.append(key)
+            elif target_params[key].shape != value.shape:
+                rejected_shape.append(key)
+            elif not load_decoder and is_decoder_key(key):
+                rejected_decoder.append(key)
             else:
-                unsuccessful += 1
-                if param_name not in rejected_keys_new and param_name not in rejected_keys_shape:
-                    rejected_keys_data.append(param_name)
+                accepted[key] = value
 
-        print(f"Succesfully transferred weights for {successful}/{successful + unsuccessful} layers")
+        if not accepted:
+            raise RuntimeError("No compatible tensors were found in the supplied state_dict")
+
+        incompatible = super().load_state_dict(accepted, strict=strict, assign=assign)
+        print(f"Transferred {len(accepted)}/{len(target_params)} target tensors")
         print(
-            f"Rejected the following keys:\n"
-            f"Not in old dict: {rejected_keys_new}.\n"
-            f"Wrong shape: {rejected_keys_shape}.\n"
-            f"Post check not succesful: {rejected_keys_data}."
+            "Rejected checkpoint keys:\n"
+            f"Not in target: {rejected_new}.\n"
+            f"Wrong shape: {rejected_shape}.\n"
+            f"Decoder disabled: {rejected_decoder}."
         )
         if not load_decoder:
-            print("Decoder weights were not loaded, as requested. If you want to load them, set `load_decoder=True`.")
-            print(f"Rejected decoder keys: {rejected_keys_decoder}.")
+            print("Decoder weights were not loaded, as requested.")
         else:
-            print("Warning! Also loaded the decoder. If you are finetuning, this might not be what you want.")
-
-        assert successful > 0, "No weights were loaded. Check the state_dict and the model architecture."
+            print("Decoder loading was enabled.")
+        return incompatible
 
     def _log_dict_of_images_to_wandb(self, imagedict: dict, log_key: str, task_type: str = ""):
         """

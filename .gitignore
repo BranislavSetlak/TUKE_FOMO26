@@ -220,3 +220,25 @@ __marimo__/
 
 /asparagus/.env.pretrain
 /asparagus/.env.finetune
+
+
+# FOMO26 local environment and generated artifacts
+/fomo_env/
+/FOMO26_broken_missing_einops/
+
+# Large model/container outputs
+*.sif
+*.ckpt
+
+/FOMO26_INFARCT_SUBMISSION/build/
+/FOMO26_INFARCT_SUBMISSION/reports/
+/FOMO26_INFARCT_SUBMISSION/container/weights/*
+!/FOMO26_INFARCT_SUBMISSION/container/weights/README.md
+
+/FOMO26_REMAINING_SUBMISSIONS/build/
+/FOMO26_REMAINING_SUBMISSIONS/reports/
+
+# Temporary validator and job records
+/fomo26_tta_validator_failures.txt
+/fomo26_validator_failures_*.txt
+/remaining_container_jobs.txt

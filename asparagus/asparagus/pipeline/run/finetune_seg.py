@@ -12,6 +12,7 @@ from asparagus.pipeline.auto_configuration.experiment_setup import (
 )
 from asparagus.pipeline.auto_configuration.logging import logging
 from dotenv import load_dotenv
+from gardening_tools.functional.paths.write import save_json
 from gardening_tools.modules.networks.components.weight_init import set_params_to_zero
 from hydra.core.hydra_config import HydraConfig
 from hydra.core.plugins import Plugins
@@ -66,23 +67,37 @@ def main(cfg: DictConfig) -> None:
 
     best_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
-        monitor="val/loss",
-        mode="min",
+        monitor=cfg.training.checkpoint_monitor,
+        mode=cfg.training.checkpoint_mode,
         save_top_k=1,
         filename="best",
         enable_version_counter=False,
     )
     last_ckpt_callback = ModelCheckpoint(
         dirpath=path_store.ckpt_save_dir,
+        save_last=True,
+        save_top_k=0,
+        enable_version_counter=False,
+    )
+    periodic_ckpt_callback = ModelCheckpoint(
+        dirpath=path_store.ckpt_save_dir,
         every_n_epochs=cfg.model.ckpt_every_n_epoch,
-        save_top_k=1,
-        filename="last",
+        save_top_k=-1,
+        filename="periodic-{epoch:03d}",
         enable_version_counter=False,
     )
 
-    progressbar_callback = TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps)
     lr_monitor_callback = LearningRateMonitor(logging_interval="epoch", log_momentum=True)
     profilers = None
+
+    callbacks = [
+        last_ckpt_callback,
+        periodic_ckpt_callback,
+        best_ckpt_callback,
+        lr_monitor_callback,
+    ]
+    if cfg.logger.progress_bar:
+        callbacks.append(TQDMProgressBar(refresh_rate=cfg.logger.log_every_n_steps))
 
     cpu_tr_transforms = instantiate(
         cfg.transforms._cpu_tr_transforms,
@@ -106,6 +121,10 @@ def main(cfg: DictConfig) -> None:
         val_transforms=cpu_val_transforms,
         test_samples=file_store.test,
         test_transforms=CPU_seg_test_transforms(patch_size=cfg.training.patch_size),
+        full_validation=cfg.training.full_validation,
+        val_batch_size=cfg.training.val_batch_size,
+        carvemix_probability=cfg.training.carvemix_probability,
+        carvemix_donor_attempts=cfg.training.carvemix_donor_attempts,
     )
 
     model = instantiate(
@@ -124,6 +143,9 @@ def main(cfg: DictConfig) -> None:
         val_transforms=None,
         optimizer=cfg.model.finetune_optim,
         learning_rate=cfg.model.finetune_lr,
+        weight_decay=cfg.model.weight_decay,
+        nesterov=cfg.model.nesterov,
+        momentum=cfg.model.momentum,
         deep_supervision=cfg.model.deep_supervision,
         inference_patch_size=cfg.training.patch_size,
         test_output_path=os.path.join(
@@ -133,16 +155,13 @@ def main(cfg: DictConfig) -> None:
         ),
         load_decoder=cfg.training.load_decoder,
         repeat_stem_weights=cfg.training.repeat_stem_weights,
+        sliding_window_validation=cfg.training.sliding_window_validation,
+        inference_overlap=cfg.training.inference_overlap,
     )
 
     trainer = instantiate(
         cfg.lightning._trainer,
-        callbacks=[
-            last_ckpt_callback,
-            best_ckpt_callback,
-            progressbar_callback,
-            lr_monitor_callback,
-        ],
+        callbacks=callbacks,
         log_every_n_steps=cfg.logger.log_every_n_steps,
         logger=loggers,
         profiler=profilers,
@@ -158,15 +177,29 @@ def main(cfg: DictConfig) -> None:
     trainer.fit(
         model=model_module,
         datamodule=data_module,
+        ckpt_path="last" if cfg.resume_training else None,
     )
 
-    model_module.model.apply(set_params_to_zero)
+    if cfg.training.run_best_validation_after_fit:
+        validation_results = trainer.validate(
+            model=model_module,
+            datamodule=data_module,
+            ckpt_path=best_ckpt_callback.best_model_path,
+        )
+        if trainer.is_global_zero:
+            save_json(
+                validation_results[0],
+                os.path.join(path_store.run_dir, "validation_best_metrics.json"),
+            )
 
-    trainer.test(
-        model=model_module,
-        datamodule=data_module,
-        ckpt_path=best_ckpt_callback.best_model_path,
-    )
+    if cfg.training.run_test_after_fit:
+        model_module.model.apply(set_params_to_zero)
+
+        trainer.test(
+            model=model_module,
+            datamodule=data_module,
+            ckpt_path=best_ckpt_callback.best_model_path,
+        )
 
 
 if __name__ == "__main__":

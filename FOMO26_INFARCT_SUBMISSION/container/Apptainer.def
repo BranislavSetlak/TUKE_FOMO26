@@ -1,0 +1,46 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+
+%labels
+    Author TUKE FOMO26
+    Version 1.0.0
+    Description FOMO26 Task 1 five-fold TUKE SwinUNETR infarct classifier
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export LC_ALL=C.UTF-8
+    export FOMO_WEIGHTS_DIR=/app/weights
+
+%files
+    predict.py /app/predict.py
+    model.py /app/model.py
+    preprocessing.py /app/preprocessing.py
+    requirements.txt /app/requirements.txt
+    weights /app/weights
+
+%post
+    set -eu
+    mkdir -p /app /input /output
+    python -m pip install --no-cache-dir --upgrade pip
+    python -m pip install --no-cache-dir -r /app/requirements.txt
+    chmod 0555 /app/predict.py
+    weight_count="$(find /app/weights -maxdepth 1 -type f -name 'fold_*.pt' | wc -l)"
+    test "${weight_count}" -eq 5 || {
+        echo "ERROR: exactly five exported fold weights are required; found ${weight_count}" >&2
+        exit 1
+    }
+    python -m py_compile /app/predict.py /app/model.py /app/preprocessing.py
+
+%test
+    python -c "from einops import rearrange; import monai, nibabel, numpy, scipy, torch; print('DEPENDENCY_IMPORTS_OK')"
+    python /app/predict.py --help >/dev/null
+    test "$(find /app/weights -maxdepth 1 -type f -name 'fold_*.pt' | wc -l)" -eq 5
+
+%runscript
+    exec python /app/predict.py "$@"
+
+%help
+    FOMO26 Task 1 infarct classification.
+    Required: --flair --adc --dwi, one of --t2s/--swi, and --output.
+

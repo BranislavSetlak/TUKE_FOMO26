@@ -1,0 +1,27 @@
+defaults:
+  - core/swinunetr_hybrid@
+
+_pretrain_net: null
+
+dimensions: 3D
+seg_net: swinunetr_segmentation
+cls_net: swinunetr_clsreg
+num_sequence_classes: 14
+
+feature_size: 48
+depths: [2, 2, 2, 2]
+num_heads: [3, 6, 12, 24]
+drop_rate: 0.0
+attn_drop_rate: 0.0
+dropout_path_rate: 0.0
+sequence_dropout_rate: 0.0
+use_checkpoint: true
+use_v2: false
+
+finetune_optim: AdamW
+finetune_lr: 3e-4
+weight_decay: 3e-5
+nesterov: true
+momentum: 0.99
+
+deep_supervision: false

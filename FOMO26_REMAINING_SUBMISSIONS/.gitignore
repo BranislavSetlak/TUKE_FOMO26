@@ -1,0 +1,8 @@
+build/
+reports/*.json
+reports/*.txt
+reports/generated_validator_data/
+containers/*/weights/*.pt
+containers/*/weights/manifest.json
+*.sif
+*.sha256

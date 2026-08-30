@@ -1,4 +1,5 @@
 from asparagus.modules.transforms.crop import Torch_Crop
+from asparagus.modules.transforms.gin import Torch_GIN
 from asparagus.modules.transforms.pad import Torch_Pad
 from gardening_tools.functional.transforms.spatial import get_max_rotated_size
 from gardening_tools.modules.transforms.bias_field import Torch_BiasField
@@ -194,7 +195,24 @@ def CPU_seg_test_transforms(patch_size, normalize=True):
     )
 
 
-def GPU_all_train_transforms(ndim=3, deep_supervision=False):
+def CPU_seg_overfit_noaug_transforms(patch_size, normalize=True):
+    """Deterministic transform for the label-derived one-case diagnostic.
+
+    The preparation job already writes an exact ``patch_size`` foreground ROI.
+    Padding and center cropping are retained as guards, while all stochastic
+    spatial and intensity augmentation is deliberately disabled.
+    """
+
+    return transforms.Compose(
+        [
+            Torch_Normalize(normalize=normalize),
+            Torch_Pad(patch_size=patch_size),
+            Torch_CenterCrop(target_size=patch_size),
+        ]
+    )
+
+
+def GPU_all_train_transforms(ndim=3, deep_supervision=False, use_gin=False):
     axes = (0, ndim)
     tforms = transforms.Compose(
         [
@@ -212,4 +230,19 @@ def GPU_all_train_transforms(ndim=3, deep_supervision=False):
     if deep_supervision:
         tforms.transforms.append(Torch_DownsampleSegForDS(deep_supervision=True))
 
+    # GIN is deliberately last so geometry and ordinary MRI intensity
+    # perturbations remain identical across the three controlled variants.
+    if use_gin:
+        if ndim != 3:
+            raise ValueError("GIN fine-tuning is defined only for 3-D inputs")
+        tforms.transforms.append(Torch_GIN(probability=1.0))
+
     return tforms
+
+
+def GPU_all_train_transforms_gin(ndim=3, deep_supervision=False):
+    return GPU_all_train_transforms(
+        ndim=ndim,
+        deep_supervision=deep_supervision,
+        use_gin=True,
+    )

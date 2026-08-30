@@ -29,30 +29,34 @@ training:
   warmup_epochs: 10
   decoder_warmup_epochs: 0
   limit_train_batches: 250
-  limit_val_batches: 50
-  target_size: [128, 128, 128]
+  limit_val_batches: 1.0
+  target_size: [96, 96, 96]
   seed: ${random:0,1000000}
   mask_ratio: 0.0
-  check_val_every_n_epoch: 3
+  check_val_every_n_epoch: 1
   accumulate_grad_batches: 1
-  load_decoder: True
-  repeat_stem_weights: True
+  load_decoder: false
+  repeat_stem_weights: true
+  full_validation: true
+  val_batch_size: 2
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
 
 transforms:
   cpu_tr_transforms: CPU_clsreg_train_transforms_crop
   cpu_val_transforms: CPU_clsreg_val_test_transforms_crop
   gpu_tr_transforms: GPU_all_train_transforms
   gpu_val_transforms:
-  normalize: True
+  normalize: true
 
 logger:
-  progress_bar: True
-  profile: False
-  wandb_log_model: False
-  wandb_logging: True
+  progress_bar: true
+  profile: false
+  wandb_log_model: false
+  wandb_logging: true
   wandb_entity: ${oc.env:WANDB_ENTITY, "team-asparagus"}
   wandb_project: Finetune
-  mlflow_logging: False
-  log_every_n_steps: 250
+  mlflow_logging: false
+  log_every_n_steps: 25
   log_images_every_n_epoch: 5
-  log_to_stdout: True
+  log_to_stdout: true

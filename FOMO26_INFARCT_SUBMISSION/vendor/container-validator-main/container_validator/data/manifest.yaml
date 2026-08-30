@@ -1,0 +1,48 @@
+task1:
+  sub_1:
+    inputs:
+      flair: inputs/task1/sub_1/flair.nii.gz
+      dwi:   inputs/task1/sub_1/dwi.nii.gz
+      adc:   inputs/task1/sub_1/adc.nii.gz
+      swi:   inputs/task1/sub_1/swi.nii.gz
+  sub_2:
+    inputs:
+      flair: inputs/task1/sub_2/flair.nii.gz
+      dwi:   inputs/task1/sub_2/dwi.nii.gz
+      adc:   inputs/task1/sub_2/adc.nii.gz
+      t2s:   inputs/task1/sub_2/t2s.nii.gz
+
+task2:
+  case_swi:
+    inputs:
+      flair: inputs/task2/case_swi/flair.nii.gz
+      dwi:   inputs/task2/case_swi/dwi.nii.gz
+      swi:   inputs/task2/case_swi/swi.nii.gz
+  case_t2s:
+    inputs:
+      flair: inputs/task2/case_t2s/flair.nii.gz
+      dwi:   inputs/task2/case_t2s/dwi.nii.gz
+      t2s:   inputs/task2/case_t2s/t2s.nii.gz
+
+task3:
+  case_001:
+    inputs:
+      t1: inputs/task3/case_001/t1w.nii.gz
+
+task4:
+  case_001:
+    inputs:
+      t2: inputs/task4/case_001/t2w.nii.gz
+
+task5:
+  case_001:
+    inputs:
+      t1: inputs/task5/case_001/input.nii.gz
+
+task6_and_7:
+  case_001:
+    inputs:
+      input: inputs/task6/case_001/t2w.nii.gz
+  case_002:
+    inputs:
+      input: inputs/task6/case_002/t1w.nii.gz

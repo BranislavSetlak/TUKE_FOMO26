@@ -1,9 +1,11 @@
 import logging
 import os
+from abc import abstractmethod
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import wandb
-from abc import abstractmethod
 from asparagus.functional.metrics.utils import format_multilabel_metrics
 from asparagus.modules.lightning_modules.base_module import BaseModule
 from gardening_tools.functional.paths.write import save_json
@@ -11,7 +13,6 @@ from torchmetrics import MetricCollection
 from torchmetrics.classification import MulticlassAccuracy, MulticlassAUROC, MulticlassPrecision, MulticlassRecall
 from torchmetrics.regression import MeanAbsoluteError, MeanSquaredError
 from torchvision import transforms
-from typing import Optional
 
 
 class ClsRegBase(BaseModule):
@@ -74,50 +75,36 @@ class ClsRegBase(BaseModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch["image"], batch["CLSREG_label"]
-
         pred = self.model(x)
         loss = self.loss(pred, y)
-
         self.log(
-            "train/loss", loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.trainer.datamodule.batch_size
+            "train/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=self.trainer.datamodule.batch_size,
         )
-
         self.train_metrics.update(pred, y)
-
-        if (
-            self.current_epoch > 0
-            and batch_idx == 0
-            and wandb.run is not None
-            and self.current_epoch % self.log_image_every_n_epochs == 0
-        ):
-            self._log_dict_of_images_to_wandb(
-                {
-                    "input": x.detach().cpu().to(torch.float32).numpy(),
-                    "target": y.detach().cpu().to(torch.float32).numpy(),
-                    "output": pred.detach().cpu().to(torch.float32).numpy(),
-                    "file": batch["file_path"],
-                },
-                log_key="train",
-                task_type=self.task_type,
-            )
-
+        self._maybe_log_images(batch_idx, x, y, pred, "train")
         return loss
-
-    def on_train_epoch_end(self):
-        metrics_results = self.train_metrics.compute()
-        formatted_metrics = format_multilabel_metrics(metrics_results, ignore_index=self.ignore_index_in_metrics)
-        self.log_dict(formatted_metrics, sync_dist=True)
-        self.train_metrics.reset()
 
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["CLSREG_label"]
-
         pred = self.model(x)
         loss = self.loss(pred, y)
-        self.log("val/loss", loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.trainer.datamodule.batch_size)
-
+        self.log(
+            "val/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=x.shape[0],
+        )
         self.val_metrics.update(pred, y)
+        self._maybe_log_images(batch_idx, x, y, pred, "val")
 
+    def _maybe_log_images(self, batch_idx, x, y, pred, split):
         if (
             self.current_epoch > 0
             and batch_idx == 0
@@ -126,19 +113,26 @@ class ClsRegBase(BaseModule):
         ):
             self._log_dict_of_images_to_wandb(
                 {
-                    "input": x.detach().cpu().to(torch.float32).numpy(),
-                    "target": y.detach().cpu().to(torch.float32).numpy(),
-                    "output": pred.detach().cpu().to(torch.float32).numpy(),
-                    "file": batch["file_path"],
+                    "input": x.detach().cpu().float().numpy(),
+                    "target": y.detach().cpu().float().numpy(),
+                    "output": pred.detach().cpu().float().numpy(),
                 },
-                log_key="val",
+                log_key=split,
                 task_type=self.task_type,
             )
 
+    def on_train_epoch_end(self):
+        results = format_multilabel_metrics(
+            self.train_metrics.compute(), ignore_index=self.ignore_index_in_metrics
+        )
+        self.log_dict(results, sync_dist=True)
+        self.train_metrics.reset()
+
     def on_validation_epoch_end(self):
-        metrics_results = self.val_metrics.compute()
-        formatted_metrics = format_multilabel_metrics(metrics_results, ignore_index=self.ignore_index_in_metrics)
-        self.log_dict(formatted_metrics, sync_dist=True)
+        results = format_multilabel_metrics(
+            self.val_metrics.compute(), ignore_index=self.ignore_index_in_metrics
+        )
+        self.log_dict(results, sync_dist=True)
         self.val_metrics.reset()
 
     def on_test_epoch_start(self):
@@ -148,33 +142,28 @@ class ClsRegBase(BaseModule):
         return super().on_test_epoch_start()
 
     def test_step(self, batch, batch_idx):
-        x = batch["image"]
-        outputs = self.model.forward(x)
-        return outputs
+        return self.model(batch["image"])
 
     def predict_step(self, batch, batch_idx):
-        x = batch["image"]
-        outputs = self.model.forward(x)
-        return outputs
+        return self.model(batch["image"])
 
     def on_test_epoch_end(self):
-        avg_results = {}
-        avg_results = self.test_metrics(
-            torch.tensor(self.predictions, device=self.predictions[0].device),
-            torch.tensor(self.labels, device=self.predictions[0].device),
-        )
-        avg_results = {key: value.cpu().numpy().tolist() for key, value in avg_results.items()}
-        self.results["metrics"] = avg_results
-        os.makedirs(os.path.split(self.test_output_path)[0], exist_ok=True)
+        predictions = torch.cat([value.reshape(-1) for value in self.predictions])
+        labels = torch.cat([value.reshape(-1) for value in self.labels])
+        averages = self.test_metrics(predictions, labels)
+        averages = {key: value.cpu().numpy().tolist() for key, value in averages.items()}
+        self.results["metrics"] = averages
+        os.makedirs(os.path.dirname(self.test_output_path), exist_ok=True)
         save_json(self.results, self.test_output_path)
-        logging.info(f"Aggregated test results for {len(self.results)} files: {avg_results}")
+        logging.info(f"Aggregated test results for {len(self.predictions)} files: {averages}")
 
 
 class ClassificationModule(ClsRegBase):
     def __init__(self, label_smoothing: float = 0.0, loss_weight: list = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.loss = torch.nn.CrossEntropyLoss(
-            weight=torch.Tensor(loss_weight) if loss_weight else None, label_smoothing=label_smoothing
+            weight=torch.tensor(loss_weight) if loss_weight else None,
+            label_smoothing=label_smoothing,
         )
         self.task_type = "classification"
 
@@ -191,7 +180,9 @@ class ClassificationModule(ClsRegBase):
             {
                 f"{prefix}/acc": MulticlassAccuracy(num_classes=self.num_classes, average=None),
                 f"{prefix}/auroc": MulticlassAUROC(num_classes=self.num_classes, average=None),
-            },
+                f"{prefix}/acc_macro": MulticlassAccuracy(num_classes=self.num_classes, average="macro"),
+                f"{prefix}/auroc_macro": MulticlassAUROC(num_classes=self.num_classes, average="macro"),
+            }
         )
 
     def on_before_batch_transfer(self, batch, dataloader_idx):
@@ -200,14 +191,16 @@ class ClassificationModule(ClsRegBase):
         return batch
 
     def on_test_batch_end(self, outputs, batch, batch_idx, dataloader_idx=0):
+        probabilities = torch.softmax(outputs, dim=1)
         prediction = outputs.argmax(1).long()
-        label = batch["CLSREG_label"]
+        label = batch["CLSREG_label"].reshape(-1).long()
         self.results[batch["file_path"]] = {
             "prediction": prediction.item(),
             "label": label.item(),
+            "probabilities": probabilities[0].detach().cpu().tolist(),
         }
-        self.predictions.append(prediction)
-        self.labels.append(label)
+        self.predictions.append(prediction.detach())
+        self.labels.append(label.detach())
 
 
 class RegressionModule(ClsRegBase):
@@ -220,7 +213,8 @@ class RegressionModule(ClsRegBase):
         return MetricCollection(
             {
                 f"{prefix}/MSE": MeanSquaredError(num_outputs=self.num_classes),
-            },
+                f"{prefix}/MAE": MeanAbsoluteError(num_outputs=self.num_classes),
+            }
         )
 
     def configure_test_metrics(self):
@@ -228,15 +222,22 @@ class RegressionModule(ClsRegBase):
             {
                 "MSE": MeanSquaredError(num_outputs=self.num_classes),
                 "MAE": MeanAbsoluteError(num_outputs=self.num_classes),
-            },
+            }
         )
 
+    def on_before_batch_transfer(self, batch, dataloader_idx):
+        if not self.trainer.predicting:
+            # Prevent MSELoss from broadcasting [B,1] predictions against [B]
+            # labels into a B-by-B loss matrix.
+            batch["CLSREG_label"] = batch["CLSREG_label"].view(-1, self.num_classes).float()
+        return batch
+
     def on_test_batch_end(self, outputs, batch, batch_idx, dataloader_idx=0):
-        prediction = outputs.squeeze().float()
-        label = batch["CLSREG_label"].squeeze().float()
+        prediction = outputs.reshape(-1).float()
+        label = batch["CLSREG_label"].reshape(-1).float()
         self.results[batch["file_path"]] = {
             "prediction": prediction.item(),
             "label": label.item(),
         }
-        self.predictions.append(prediction)
-        self.labels.append(label)
+        self.predictions.append(prediction.detach())
+        self.labels.append(label.detach())
